@@ -7,6 +7,20 @@ const DEX = "https://api.dexscreener.com";
 const HELIUS = "https://api.helius.xyz/v0";
 const WSOL = "So11111111111111111111111111111111111111112";
 
+export interface TokenPositionInfo {
+  mint: string;
+  symbol: string;
+  buyUsd: number;
+  sellUsd: number;
+  pnlUsd: number;
+  pnlPct: number;
+  buyCount: number;
+  sellCount: number;
+  holdMinutes: number;
+  lastTs: number;
+  status: "closed" | "open";
+}
+
 export interface SmartWallet {
   address: string;
   winRate: number;
@@ -17,9 +31,16 @@ export interface SmartWallet {
   avgBuyUsd: number;
   avgHoldMinutes: number;
   lastActivity: number;
+  firstActivity: number;
+  totalBuyVolumeUsd: number;
+  totalSellVolumeUsd: number;
+  openPositions: number;
+  bestTrade: { symbol: string; pnlUsd: number; pnlPct: number } | null;
+  worstTrade: { symbol: string; pnlUsd: number; pnlPct: number } | null;
   score: number;
   tags: string[];
   recentBuys: RecentBuy[];
+  positions: TokenPositionInfo[];
 }
 
 export interface RecentBuy {
@@ -58,7 +79,6 @@ async function heliusFetch(url: string, retries = 2): Promise<HeliusTx[]> {
     try {
       const r = await fetch(url, { signal: AbortSignal.timeout(9000) });
       if (r.status === 429) {
-        // rate limited — back off and retry
         await sleep(600 * (attempt + 1));
         continue;
       }
@@ -72,7 +92,6 @@ async function heliusFetch(url: string, retries = 2): Promise<HeliusTx[]> {
   return [];
 }
 
-// Run tasks with limited concurrency to respect Helius 10 req/s limit
 async function pool<T, R>(items: T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results: R[] = [];
   let idx = 0;
@@ -80,7 +99,7 @@ async function pool<T, R>(items: T[], concurrency: number, fn: (item: T) => Prom
     while (idx < items.length) {
       const i = idx++;
       results[i] = await fn(items[i]);
-      await sleep(150); // spacing between requests per worker
+      await sleep(150);
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
@@ -95,6 +114,31 @@ async function getSolPrice(): Promise<number> {
     const p = parseFloat(d.pairs?.[0]?.priceUsd || "0");
     return p > 1 ? p : 170;
   } catch { return 170; }
+}
+
+// Resolve token mints → symbols via DEX Screener (cached at module level)
+const symbolCache = new Map<string, string>();
+
+async function resolveSymbols(mints: string[]): Promise<Map<string, string>> {
+  const unknown = mints.filter((m) => !symbolCache.has(m));
+  for (let i = 0; i < unknown.length; i += 30) {
+    try {
+      const chunk = unknown.slice(i, i + 30).join(",");
+      const r = await fetch(`${DEX}/latest/dex/tokens/${chunk}`, { next: { revalidate: 300 } });
+      if (!r.ok) continue;
+      const d = await r.json();
+      for (const p of (d.pairs || []) as { baseToken: { address: string; symbol: string } }[]) {
+        if (p.baseToken?.address && p.baseToken?.symbol) {
+          symbolCache.set(p.baseToken.address, p.baseToken.symbol);
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  const out = new Map<string, string>();
+  for (const m of mints) {
+    out.set(m, symbolCache.get(m) || m.slice(0, 4) + "..." + m.slice(-4));
+  }
+  return out;
 }
 
 interface TrendingPair {
@@ -127,7 +171,6 @@ async function getActivePairs(): Promise<TrendingPair[]> {
   const mintList = Array.from(mints);
   const pairs: TrendingPair[] = [];
 
-  // DEX Screener allows up to 30 addresses per request
   for (let i = 0; i < mintList.length; i += 30) {
     try {
       const chunk = mintList.slice(i, i + 30).join(",");
@@ -150,11 +193,13 @@ async function getActivePairs(): Promise<TrendingPair[]> {
           priceChange1h: p.priceChange?.h1 || 0,
           volumeH1: p.volume?.h1 || 0,
         });
+        if (p.baseToken?.address && p.baseToken?.symbol) {
+          symbolCache.set(p.baseToken.address, p.baseToken.symbol);
+        }
       }
     } catch { /* ignore */ }
   }
 
-  // Dedupe by pair, sort by 1h volume
   const seen = new Set<string>();
   return pairs
     .filter((p) => !seen.has(p.pairAddress) && seen.add(p.pairAddress))
@@ -164,7 +209,7 @@ async function getActivePairs(): Promise<TrendingPair[]> {
 
 // ---------- wallet analysis ----------
 
-interface TokenPosition {
+interface RawPosition {
   buys: { usd: number; ts: number }[];
   sells: { usd: number; ts: number }[];
 }
@@ -186,7 +231,6 @@ function extractSwap(tx: HeliusTx, wallet: string, solPrice: number): { mint: st
     }
   }
 
-  // Fallback via transfers
   const solSent = (tx.nativeTransfers || []).filter((t) => t.fromUserAccount === wallet).reduce((s, t) => s + t.amount, 0) / 1e9;
   const solRecv = (tx.nativeTransfers || []).filter((t) => t.toUserAccount === wallet).reduce((s, t) => s + t.amount, 0) / 1e9;
   const tokRecv = (tx.tokenTransfers || []).find((t) => t.toUserAccount === wallet && t.mint !== WSOL);
@@ -198,7 +242,7 @@ function extractSwap(tx: HeliusTx, wallet: string, solPrice: number): { mint: st
 }
 
 function analyzeWallet(txns: HeliusTx[], wallet: string, solPrice: number) {
-  const positions = new Map<string, TokenPosition>();
+  const positions = new Map<string, RawPosition>();
 
   for (const tx of txns) {
     const swap = extractSwap(tx, wallet, solPrice);
@@ -209,34 +253,73 @@ function analyzeWallet(txns: HeliusTx[], wallet: string, solPrice: number) {
     else pos.sells.push({ usd: swap.usd, ts: tx.timestamp });
   }
 
-  let wins = 0, losses = 0, realizedPnl = 0, totalBuyUsd = 0, buyCount = 0;
+  let wins = 0, losses = 0, realizedPnl = 0, totalBuyUsd = 0, totalSellUsd = 0, buyCount = 0;
   const holdTimes: number[] = [];
+  const positionInfos: Omit<TokenPositionInfo, "symbol">[] = [];
 
-  for (const pos of positions.values()) {
+  for (const [mint, pos] of positions.entries()) {
+    if (!pos.buys.length && !pos.sells.length) continue;
     const buyUsd = pos.buys.reduce((s, t) => s + t.usd, 0);
     const sellUsd = pos.sells.reduce((s, t) => s + t.usd, 0);
     totalBuyUsd += buyUsd;
+    totalSellUsd += sellUsd;
     buyCount += pos.buys.length;
 
-    // Closed (or partially closed) position → realized PnL
+    const allTs = [...pos.buys, ...pos.sells].map((t) => t.ts);
+    const lastTs = Math.max(...allTs);
+
     if (pos.buys.length && pos.sells.length) {
       const pnl = sellUsd - buyUsd;
       realizedPnl += pnl;
       if (pnl > 0) wins++; else losses++;
+
       const firstBuy = Math.min(...pos.buys.map((t) => t.ts));
       const lastSell = Math.max(...pos.sells.map((t) => t.ts));
-      if (lastSell > firstBuy) holdTimes.push((lastSell - firstBuy) / 60);
+      const holdMin = lastSell > firstBuy ? (lastSell - firstBuy) / 60 : 0;
+      if (holdMin > 0) holdTimes.push(holdMin);
+
+      positionInfos.push({
+        mint,
+        buyUsd: Math.round(buyUsd),
+        sellUsd: Math.round(sellUsd),
+        pnlUsd: Math.round(pnl),
+        pnlPct: buyUsd > 0 ? Math.round((pnl / buyUsd) * 1000) / 10 : 0,
+        buyCount: pos.buys.length,
+        sellCount: pos.sells.length,
+        holdMinutes: Math.round(holdMin),
+        lastTs,
+        status: "closed",
+      });
+    } else if (pos.buys.length) {
+      positionInfos.push({
+        mint,
+        buyUsd: Math.round(buyUsd),
+        sellUsd: 0,
+        pnlUsd: 0,
+        pnlPct: 0,
+        buyCount: pos.buys.length,
+        sellCount: 0,
+        holdMinutes: 0,
+        lastTs,
+        status: "open",
+      });
     }
   }
+
+  const allTs = txns.map((t) => t.timestamp);
 
   return {
     wins,
     losses,
     totalPnlUsd: realizedPnl,
+    totalBuyVolumeUsd: totalBuyUsd,
+    totalSellVolumeUsd: totalSellUsd,
     avgBuyUsd: buyCount ? totalBuyUsd / buyCount : 0,
     avgHoldMinutes: holdTimes.length ? holdTimes.reduce((a, b) => a + b, 0) / holdTimes.length : 0,
-    lastActivity: txns.length ? Math.max(...txns.map((t) => t.timestamp)) : 0,
-    openPositions: Array.from(positions.values()).filter((p) => p.buys.length && !p.sells.length).length,
+    lastActivity: allTs.length ? Math.max(...allTs) : 0,
+    firstActivity: allTs.length ? Math.min(...allTs) : 0,
+    openPositions: positionInfos.filter((p) => p.status === "open").length,
+    positionInfos,
   };
 }
 
@@ -261,7 +344,7 @@ function calcTags(w: SmartWallet): string[] {
   return tags;
 }
 
-// ---------- caching (module-level, survives warm invocations) ----------
+// ---------- caching ----------
 
 const walletCache = new Map<string, { data: SmartWallet; ts: number }>();
 let lastGoodScan: { wallets: SmartWallet[]; ts: number; scannedPairs: number; scannedWallets: number } | null = null;
@@ -283,7 +366,6 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  // Serve recent scan from cache (avoids hammering Helius on every page load)
   if (!forceRefresh && lastGoodScan && Date.now() - lastGoodScan.ts < SCAN_TTL) {
     return NextResponse.json({
       wallets: lastGoodScan.wallets,
@@ -302,12 +384,10 @@ export async function GET(req: NextRequest) {
       return respondWithFallback("Нет активных пар для сканирования");
     }
 
-    // Step 1: pull recent swaps from top pairs (concurrency 3, respects rate limit)
     const pairTxLists = await pool(pairs, 3, (p) =>
       heliusFetch(`${HELIUS}/addresses/${p.pairAddress}/transactions?api-key=${apiKey}&type=SWAP&limit=100`)
     );
 
-    // Step 2: collect wallet candidates + their recent buys on these pairs
     const walletBuys = new Map<string, RecentBuy[]>();
 
     pairs.forEach((pair, i) => {
@@ -334,7 +414,6 @@ export async function GET(req: NextRequest) {
       }
     });
 
-    // Prioritize wallets seen buying on multiple pairs or with bigger buys
     const candidates = Array.from(walletBuys.entries())
       .sort((a, b) => {
         const aScore = a[1].length * 1000 + Math.max(...a[1].map((x) => x.buyAmountUsd));
@@ -344,14 +423,12 @@ export async function GET(req: NextRequest) {
       .slice(0, 25)
       .map(([addr]) => addr);
 
-    // Step 3: analyze each candidate's trade history (use cache when fresh)
     const results: SmartWallet[] = [];
     const toFetch: string[] = [];
 
     for (const addr of candidates) {
       const cached = walletCache.get(addr);
       if (cached && Date.now() - cached.ts < WALLET_TTL) {
-        // refresh recentBuys from this scan
         cached.data.recentBuys = walletBuys.get(addr) || cached.data.recentBuys;
         results.push(cached.data);
       } else {
@@ -363,20 +440,46 @@ export async function GET(req: NextRequest) {
       heliusFetch(`${HELIUS}/addresses/${addr}/transactions?api-key=${apiKey}&type=SWAP&limit=100`)
     );
 
+    const pendingWallets: { addr: string; stats: ReturnType<typeof analyzeWallet> }[] = [];
+
     toFetch.forEach((addr, i) => {
       const txns = walletTxLists[i] || [];
       if (txns.length < 2) return;
 
       const stats = analyzeWallet(txns, addr, solPrice);
       const totalTrades = stats.wins + stats.losses;
-
-      // Need at least 1 closed trade to judge
       if (totalTrades < 1) return;
 
       const winRate = Math.round((stats.wins / totalTrades) * 100);
-
-      // Keep only profitable-looking wallets
       if (stats.totalPnlUsd <= 0 && winRate < 50) return;
+
+      pendingWallets.push({ addr, stats });
+    });
+
+    // Resolve symbols for all position mints in one batch
+    const allMints = new Set<string>();
+    for (const pw of pendingWallets) {
+      for (const p of pw.stats.positionInfos) allMints.add(p.mint);
+    }
+    const symbols = await resolveSymbols(Array.from(allMints).slice(0, 90));
+
+    for (const { addr, stats } of pendingWallets) {
+      const totalTrades = stats.wins + stats.losses;
+      const winRate = Math.round((stats.wins / totalTrades) * 100);
+
+      // Build enriched positions, sorted: open first (by recency), then closed by |pnl|
+      const positions: TokenPositionInfo[] = stats.positionInfos
+        .map((p) => ({ ...p, symbol: symbols.get(p.mint) || p.mint.slice(0, 6) }))
+        .sort((a, b) => {
+          if (a.status !== b.status) return a.status === "open" ? -1 : 1;
+          if (a.status === "open") return b.lastTs - a.lastTs;
+          return Math.abs(b.pnlUsd) - Math.abs(a.pnlUsd);
+        })
+        .slice(0, 12);
+
+      const closed = positions.filter((p) => p.status === "closed");
+      const best = closed.length ? closed.reduce((a, b) => (b.pnlUsd > a.pnlUsd ? b : a)) : null;
+      const worst = closed.length ? closed.reduce((a, b) => (b.pnlUsd < a.pnlUsd ? b : a)) : null;
 
       const partial = {
         address: addr,
@@ -388,7 +491,14 @@ export async function GET(req: NextRequest) {
         avgBuyUsd: Math.round(stats.avgBuyUsd),
         avgHoldMinutes: Math.round(stats.avgHoldMinutes),
         lastActivity: stats.lastActivity,
+        firstActivity: stats.firstActivity,
+        totalBuyVolumeUsd: Math.round(stats.totalBuyVolumeUsd),
+        totalSellVolumeUsd: Math.round(stats.totalSellVolumeUsd),
+        openPositions: stats.openPositions,
+        bestTrade: best ? { symbol: best.symbol, pnlUsd: best.pnlUsd, pnlPct: best.pnlPct } : null,
+        worstTrade: worst ? { symbol: worst.symbol, pnlUsd: worst.pnlUsd, pnlPct: worst.pnlPct } : null,
         recentBuys: walletBuys.get(addr) || [],
+        positions,
       };
 
       const score = calcScore(partial);
@@ -397,11 +507,10 @@ export async function GET(req: NextRequest) {
 
       walletCache.set(addr, { data: wallet, ts: Date.now() });
       results.push(wallet);
-    });
+    }
 
     const sorted = results.sort((a, b) => b.score - a.score).slice(0, 20);
 
-    // Merge with previous scan so the list grows over time instead of shrinking
     let finalList = sorted;
     if (lastGoodScan) {
       const have = new Set(sorted.map((w) => w.address));
@@ -458,20 +567,39 @@ function getDemoWallets(): SmartWallet[] {
     {
       address: "9nn6KBHBGMGrTHPiwvqgbJUGMfaQdnaqCYCmQpTwjBBZ",
       winRate: 84, totalPnlUsd: 127400, totalTrades: 89, wins: 75, losses: 14,
-      avgBuyUsd: 1200, avgHoldMinutes: 18, lastActivity: now - 1200, score: 92,
+      avgBuyUsd: 1200, avgHoldMinutes: 18, lastActivity: now - 1200, firstActivity: now - 86400 * 30,
+      totalBuyVolumeUsd: 340000, totalSellVolumeUsd: 467400, openPositions: 2,
+      bestTrade: { symbol: "WIF", pnlUsd: 24800, pnlPct: 312 },
+      worstTrade: { symbol: "MYRO", pnlUsd: -1900, pnlPct: -42 },
+      score: 92,
       tags: ["🔥 Top Trader", "💰 Profitable", "⚡ Sniper"],
       recentBuys: [
         { tokenSymbol: "BONK", tokenAddress: "", pairAddress: "", buyAmountUsd: 2400, buyTime: now - 3600, priceChangeAfter: 34.2, status: "sold_profit" },
         { tokenSymbol: "WIF", tokenAddress: "", pairAddress: "", buyAmountUsd: 1800, buyTime: now - 7200, priceChangeAfter: 18.7, status: "sold_profit" },
       ],
+      positions: [
+        { mint: "", symbol: "POPCAT", buyUsd: 3200, sellUsd: 0, pnlUsd: 0, pnlPct: 0, buyCount: 2, sellCount: 0, holdMinutes: 0, lastTs: now - 1200, status: "open" },
+        { mint: "", symbol: "WIF", buyUsd: 7950, sellUsd: 32750, pnlUsd: 24800, pnlPct: 312, buyCount: 3, sellCount: 2, holdMinutes: 340, lastTs: now - 7200, status: "closed" },
+        { mint: "", symbol: "BONK", buyUsd: 5100, sellUsd: 12400, pnlUsd: 7300, pnlPct: 143.1, buyCount: 2, sellCount: 1, holdMinutes: 95, lastTs: now - 3600, status: "closed" },
+        { mint: "", symbol: "MYRO", buyUsd: 4500, sellUsd: 2600, pnlUsd: -1900, pnlPct: -42.2, buyCount: 1, sellCount: 1, holdMinutes: 22, lastTs: now - 43200, status: "closed" },
+      ],
     },
     {
       address: "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ",
       winRate: 78, totalPnlUsd: 84200, totalTrades: 134, wins: 104, losses: 30,
-      avgBuyUsd: 650, avgHoldMinutes: 45, lastActivity: now - 2700, score: 85,
+      avgBuyUsd: 650, avgHoldMinutes: 45, lastActivity: now - 2700, firstActivity: now - 86400 * 60,
+      totalBuyVolumeUsd: 187000, totalSellVolumeUsd: 271200, openPositions: 1,
+      bestTrade: { symbol: "MEW", pnlUsd: 11200, pnlPct: 187 },
+      worstTrade: { symbol: "BOME", pnlUsd: -800, pnlPct: -18 },
+      score: 85,
       tags: ["🎯 Smart Money", "💰 Profitable", "🏃 Flipper"],
       recentBuys: [
         { tokenSymbol: "MEW", tokenAddress: "", pairAddress: "", buyAmountUsd: 1100, buyTime: now - 1800, priceChangeAfter: 22.5, status: "sold_profit" },
+      ],
+      positions: [
+        { mint: "", symbol: "JUP", buyUsd: 900, sellUsd: 0, pnlUsd: 0, pnlPct: 0, buyCount: 1, sellCount: 0, holdMinutes: 0, lastTs: now - 2700, status: "open" },
+        { mint: "", symbol: "MEW", buyUsd: 5990, sellUsd: 17190, pnlUsd: 11200, pnlPct: 187, buyCount: 4, sellCount: 3, holdMinutes: 120, lastTs: now - 1800, status: "closed" },
+        { mint: "", symbol: "BOME", buyUsd: 4400, sellUsd: 3600, pnlUsd: -800, pnlPct: -18.2, buyCount: 2, sellCount: 2, holdMinutes: 60, lastTs: now - 21600, status: "closed" },
       ],
     },
   ];
