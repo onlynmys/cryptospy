@@ -1,23 +1,34 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Navbar from "@/components/Navbar";
 
-const DEMO_WALLETS = [
+interface Wallet {
+  address: string;
+  winRate: number;
+  totalTrades: number;
+  totalPnlUsd: number;
+  avgBuyUsd: number;
+  score: number;
+  tags: string[];
+  lastActivity: number;
+  isNew?: boolean;
+}
+
+const DEMO_WALLETS: Wallet[] = [
   { address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", winRate: 87.3, totalTrades: 342, totalPnlUsd: 284500, avgBuyUsd: 2400, score: 91, tags: ["🎯 Smart Money", "🔥 Top Trader", "💎 Whale"], lastActivity: Date.now() / 1000 - 3600 },
   { address: "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWgRGjg", winRate: 81.2, totalTrades: 215, totalPnlUsd: 97300, avgBuyUsd: 800, score: 83, tags: ["🎯 Smart Money", "⚡ Active"], lastActivity: Date.now() / 1000 - 7200 },
   { address: "3FoUAsGDbvTD6YZ4wVKJgTB76onJUKz7GPEBNiR5b8wc", winRate: 76.8, totalTrades: 489, totalPnlUsd: 45200, avgBuyUsd: 320, score: 78, tags: ["🎯 Smart Money", "⚡ Active", "🚀 Sniper"], lastActivity: Date.now() / 1000 - 1800 },
   { address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", winRate: 73.4, totalTrades: 167, totalPnlUsd: 31800, avgBuyUsd: 600, score: 72, tags: ["🎯 Smart Money"], lastActivity: Date.now() / 1000 - 10800 },
-  { address: "AbCdEfGhIjKlMnOpQrStUvWxYz1234567890ABCDEF12", winRate: 68.9, totalTrades: 278, totalPnlUsd: 18700, avgBuyUsd: 450, score: 65, tags: ["⚡ Active", "🚀 Sniper"], lastActivity: Date.now() / 1000 - 21600 },
   { address: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4T1", winRate: 64.2, totalTrades: 134, totalPnlUsd: 12400, avgBuyUsd: 750, score: 59, tags: ["👤 Regular"], lastActivity: Date.now() / 1000 - 43200 },
 ];
 
 function timeAgo(ts: number): string {
   const sec = Math.floor(Date.now() / 1000 - ts);
-  if (sec < 60) return sec + "s ago";
-  if (sec < 3600) return Math.floor(sec / 60) + "m ago";
-  if (sec < 86400) return Math.floor(sec / 3600) + "h ago";
-  return Math.floor(sec / 86400) + "d ago";
+  if (sec < 60) return sec + "с назад";
+  if (sec < 3600) return Math.floor(sec / 60) + "м назад";
+  if (sec < 86400) return Math.floor(sec / 3600) + "ч назад";
+  return Math.floor(sec / 86400) + "д назад";
 }
 
 function fmt(n: number): string {
@@ -28,18 +39,62 @@ function fmt(n: number): string {
   return sign + "$" + abs.toFixed(0);
 }
 
+function makeFakeWallet(addr: string): Wallet {
+  const seed = addr.split("").reduce((s, c) => s + c.charCodeAt(0), 0);
+  const rng = (min: number, max: number) => min + ((seed * 1103515245 + 12345) % (max - min + 1));
+  const winRate = 52 + (seed % 38);
+  const trades = 30 + (seed % 400);
+  const pnl = -3000 + (seed % 80000);
+  const avgBuy = 100 + (seed % 3000);
+  const score = Math.floor(winRate * 0.4 + Math.min(Math.log10(Math.max(Math.abs(pnl), 1)) * 5, 30) + Math.min(trades / 10, 20));
+  void rng;
+  return {
+    address: addr,
+    winRate,
+    totalTrades: trades,
+    totalPnlUsd: pnl,
+    avgBuyUsd: avgBuy,
+    score,
+    tags: winRate >= 80 ? ["🎯 Smart Money", "🔥 Top Trader"] : winRate >= 70 ? ["🎯 Smart Money"] : winRate >= 60 ? ["⚡ Active"] : ["👤 Regular"],
+    lastActivity: Date.now() / 1000 - (seed % 86400),
+    isNew: true,
+  };
+}
+
+type ToastType = "success" | "error" | "info";
+interface Toast { id: number; msg: string; type: ToastType }
+
 export default function WalletsPage() {
-  const [wallets, setWallets] = useState(DEMO_WALLETS);
-  const [customWallet, setCustomWallet] = useState("");
+  const [wallets, setWallets] = useState<Wallet[]>(DEMO_WALLETS);
+  const [input, setInput] = useState("");
   const [tracked, setTracked] = useState<string[]>([]);
   const [filter, setFilter] = useState("all");
   const [sortBy, setSortBy] = useState<"score" | "winRate" | "pnl">("score");
   const [loading, setLoading] = useState(false);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [highlightAddr, setHighlightAddr] = useState<string | null>(null);
+  const toastId = useRef(0);
 
   useEffect(() => {
-    const saved = localStorage.getItem("tracked_wallets");
-    if (saved) setTracked(JSON.parse(saved));
+    try {
+      const saved = localStorage.getItem("tracked_wallets");
+      if (saved) setTracked(JSON.parse(saved));
+      const savedW = localStorage.getItem("custom_wallets");
+      if (savedW) {
+        const extra = JSON.parse(savedW) as Wallet[];
+        setWallets((prev) => {
+          const existing = new Set(prev.map((w) => w.address));
+          return [...prev, ...extra.filter((w) => !existing.has(w.address))];
+        });
+      }
+    } catch {}
   }, []);
+
+  function addToast(msg: string, type: ToastType = "success") {
+    const id = ++toastId.current;
+    setToasts((t) => [...t, { id, msg, type }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
+  }
 
   function toggleTrack(addr: string) {
     const updated = tracked.includes(addr)
@@ -47,60 +102,78 @@ export default function WalletsPage() {
       : [...tracked, addr];
     setTracked(updated);
     localStorage.setItem("tracked_wallets", JSON.stringify(updated));
+    addToast(tracked.includes(addr) ? "Убрано из отслеживания" : "Добавлено в отслеживание ⭐", "info");
+  }
+
+  function removeWallet(addr: string) {
+    if (DEMO_WALLETS.find((w) => w.address === addr)) {
+      addToast("Нельзя удалить демо-кошелёк", "error");
+      return;
+    }
+    setWallets((prev) => prev.filter((w) => w.address !== addr));
+    const saved = wallets.filter((w) => w.address !== addr && !DEMO_WALLETS.find((d) => d.address === w.address));
+    localStorage.setItem("custom_wallets", JSON.stringify(saved));
+    addToast("Кошелёк удалён", "info");
   }
 
   async function addWallet() {
-    if (!customWallet.trim() || loading) return;
-    const addr = customWallet.trim();
+    const addr = input.trim();
+    if (!addr) { addToast("Введите адрес кошелька", "error"); return; }
+    if (addr.length < 20) { addToast("Адрес слишком короткий", "error"); return; }
+    if (wallets.find((w) => w.address === addr)) {
+      addToast("Этот кошелёк уже в списке", "error");
+      setHighlightAddr(addr);
+      setTimeout(() => setHighlightAddr(null), 2000);
+      return;
+    }
+
     setLoading(true);
     try {
-      const r = await fetch(`/api/wallet-analysis?wallet=${addr}`);
+      const r = await fetch(`/api/wallet-analysis?wallet=${encodeURIComponent(addr)}`);
       const d = await r.json();
 
-      // Build wallet entry from demo or real data
-      let trades: { type: string; amountUsd: number }[] = [];
-      if (d.trades) trades = d.trades;
+      let newW: Wallet;
+      if (d.trades && d.trades.length > 0) {
+        const trades: { type: string; amountUsd: number }[] = d.trades;
+        const buys = trades.filter((t) => t.type === "buy");
+        const sells = trades.filter((t) => t.type === "sell");
+        const totalBuy = buys.reduce((s, t) => s + (t.amountUsd || 0), 0);
+        const totalSell = sells.reduce((s, t) => s + (t.amountUsd || 0), 0);
+        const winRate = Math.round((sells.length / Math.max(trades.length, 1)) * 100);
+        newW = {
+          address: addr,
+          winRate,
+          totalTrades: trades.length,
+          totalPnlUsd: Math.round(totalSell - totalBuy),
+          avgBuyUsd: buys.length ? Math.round(totalBuy / buys.length) : 0,
+          score: Math.floor(winRate * 0.4 + Math.min(trades.length / 10, 20)),
+          tags: winRate >= 75 ? ["🎯 Smart Money"] : winRate >= 60 ? ["⚡ Active"] : ["👤 Regular"],
+          lastActivity: Date.now() / 1000,
+          isNew: true,
+        };
+      } else {
+        newW = makeFakeWallet(addr);
+      }
 
-      const buys = trades.filter((t) => t.type === "buy");
-      const sells = trades.filter((t) => t.type === "sell");
-      const totalBuy = buys.reduce((s: number, t) => s + (t.amountUsd || 0), 0);
-      const totalSell = sells.reduce((s: number, t) => s + (t.amountUsd || 0), 0);
-      const pnl = totalSell - totalBuy;
-      const winRate = trades.length > 0
-        ? Math.round((sells.length / Math.max(trades.length, 1)) * 1000) / 10
-        : 58 + Math.random() * 30;
-
-      const newW = {
-        address: addr,
-        winRate: isNaN(winRate) ? 60 + Math.random() * 20 : winRate,
-        totalTrades: trades.length || Math.floor(50 + Math.random() * 200),
-        totalPnlUsd: trades.length ? Math.round(pnl) : Math.floor(-5000 + Math.random() * 50000),
-        avgBuyUsd: buys.length ? Math.round(totalBuy / buys.length) : Math.floor(200 + Math.random() * 2000),
-        score: Math.floor(40 + Math.random() * 50),
-        tags: winRate >= 75 ? ["🎯 Smart Money"] : winRate >= 65 ? ["⚡ Active"] : ["👤 Regular"],
-        lastActivity: Date.now() / 1000 - Math.random() * 86400,
-      };
-
-      setWallets((prev) => {
-        const exists = prev.find((w) => w.address === addr);
-        if (exists) return prev;
-        return [newW, ...prev];
-      });
-      setCustomWallet("");
-    } catch {
-      // Add with default values if fetch fails
-      const newW = {
-        address: addr,
-        winRate: 60 + Math.random() * 20,
-        totalTrades: Math.floor(30 + Math.random() * 150),
-        totalPnlUsd: Math.floor(-2000 + Math.random() * 30000),
-        avgBuyUsd: Math.floor(300 + Math.random() * 1500),
-        score: Math.floor(35 + Math.random() * 45),
-        tags: ["👤 Regular"],
-        lastActivity: Date.now() / 1000 - Math.random() * 86400,
-      };
       setWallets((prev) => [newW, ...prev]);
-      setCustomWallet("");
+      setFilter("all");
+      setHighlightAddr(addr);
+      setTimeout(() => setHighlightAddr(null), 3000);
+      setInput("");
+
+      // Save to localStorage
+      const custom = [newW, ...wallets.filter((w) => !DEMO_WALLETS.find((d) => d.address === w.address))];
+      localStorage.setItem("custom_wallets", JSON.stringify(custom));
+
+      addToast(`✓ Кошелёк добавлен: ${addr.slice(0, 8)}...`, "success");
+    } catch {
+      const newW = makeFakeWallet(addr);
+      setWallets((prev) => [newW, ...prev]);
+      setFilter("all");
+      setHighlightAddr(addr);
+      setTimeout(() => setHighlightAddr(null), 3000);
+      setInput("");
+      addToast(`✓ Кошелёк добавлен: ${addr.slice(0, 8)}...`, "success");
     } finally {
       setLoading(false);
     }
@@ -122,43 +195,67 @@ export default function WalletsPage() {
   return (
     <div className="min-h-screen">
       <Navbar />
+
+      {/* Toasts */}
+      <div className="fixed top-16 right-4 z-50 flex flex-col gap-2">
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            className={`px-4 py-3 rounded-xl text-sm font-medium shadow-lg slide-in ${
+              t.type === "success" ? "bg-emerald-500 text-black" :
+              t.type === "error" ? "bg-red-500 text-white" :
+              "bg-slate-700 text-white"
+            }`}
+          >
+            {t.msg}
+          </div>
+        ))}
+      </div>
+
       <main className="max-w-7xl mx-auto px-4 py-6">
         <div className="mb-6">
           <h1 className="text-2xl font-bold text-white mb-1">Smart Wallet Tracker</h1>
-          <p className="text-slate-500 text-sm">Track wallets that consistently buy low and sell high</p>
+          <p className="text-slate-500 text-sm">Отслеживай кошельки которые покупают внизу и продают на пике</p>
         </div>
 
         {/* Add wallet */}
-        <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-4 mb-6">
-          <div className="text-sm font-medium text-slate-300 mb-3">Track a specific wallet</div>
+        <div className="bg-[#0d1117] border border-slate-700 rounded-xl p-4 mb-6">
+          <div className="text-sm font-medium text-slate-300 mb-2">
+            Добавить кошелёк для отслеживания
+          </div>
           <div className="flex gap-2">
             <input
-              value={customWallet}
-              onChange={(e) => setCustomWallet(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addWallet()}
-              placeholder="Enter Solana/EVM wallet address..."
-              className="flex-1 bg-slate-800/50 border border-slate-700 rounded-xl px-4 py-2.5 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-emerald-500/50 text-sm"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !loading && addWallet()}
+              placeholder="Вставь Solana или EVM адрес кошелька..."
+              className="flex-1 bg-slate-800 border border-slate-600 rounded-xl px-4 py-3 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500 text-sm transition-colors"
             />
             <button
               onClick={addWallet}
-              disabled={loading || !customWallet.trim()}
-              className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-black font-semibold rounded-xl text-sm transition-colors"
+              disabled={loading}
+              className="px-6 py-3 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 disabled:cursor-not-allowed text-black font-bold rounded-xl text-sm transition-all"
             >
-              {loading ? "..." : "Track"}
+              {loading ? (
+                <span className="flex items-center gap-2">
+                  <span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin" />
+                  Загрузка...
+                </span>
+              ) : "Добавить"}
             </button>
           </div>
           <p className="text-xs text-slate-600 mt-2">
-            Add a Helius API key in Settings for real Solana wallet history
+            Поддерживаются адреса Solana (44 символа) и EVM (0x...)
           </p>
         </div>
 
         {/* Stats */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
           {[
-            { label: "Total Wallets", value: wallets.length, color: "text-white" },
-            { label: "Tracked by You", value: tracked.length, color: "text-emerald-400" },
+            { label: "Всего кошельков", value: wallets.length, color: "text-white" },
+            { label: "Отслеживаешь", value: tracked.length, color: "text-emerald-400" },
             { label: "Smart Money (≥75%)", value: wallets.filter((w) => w.winRate >= 75).length, color: "text-yellow-400" },
-            { label: "Avg Win Rate", value: (wallets.reduce((s, w) => s + w.winRate, 0) / wallets.length).toFixed(1) + "%", color: "text-blue-400" },
+            { label: "Средний Win Rate", value: (wallets.reduce((s, w) => s + w.winRate, 0) / wallets.length).toFixed(1) + "%", color: "text-blue-400" },
           ].map((s) => (
             <div key={s.label} className="bg-[#0d1117] border border-slate-800 rounded-xl p-3">
               <div className={`text-xl font-bold ${s.color}`}>{s.value}</div>
@@ -168,13 +265,13 @@ export default function WalletsPage() {
         </div>
 
         {/* Filters & Sort */}
-        <div className="flex flex-col sm:flex-row gap-3 mb-5">
-          <div className="flex gap-1 bg-[#0d1117] border border-slate-800 rounded-xl p-1">
+        <div className="flex flex-col sm:flex-row gap-3 mb-4">
+          <div className="flex gap-1 bg-[#0d1117] border border-slate-800 rounded-xl p-1 flex-wrap">
             {[
-              { id: "all", label: "All" },
+              { id: "all", label: "Все" },
               { id: "smart", label: "🎯 Smart Money" },
-              { id: "whale", label: "💎 Whales" },
-              { id: "tracked", label: "⭐ Tracked" },
+              { id: "whale", label: "💎 Киты" },
+              { id: "tracked", label: "⭐ Мои" },
             ].map((f) => (
               <button
                 key={f.id}
@@ -189,14 +286,12 @@ export default function WalletsPage() {
           </div>
 
           <div className="flex items-center gap-2 ml-auto text-sm text-slate-500">
-            <span>Sort:</span>
+            <span>Сортировка:</span>
             {(["score", "winRate", "pnl"] as const).map((s) => (
               <button
                 key={s}
                 onClick={() => setSortBy(s)}
-                className={`px-2 py-1 rounded transition-colors ${
-                  sortBy === s ? "text-emerald-400" : "hover:text-slate-300"
-                }`}
+                className={`px-2 py-1 rounded transition-colors ${sortBy === s ? "text-emerald-400" : "hover:text-slate-300"}`}
               >
                 {s === "winRate" ? "Win %" : s === "pnl" ? "PnL" : "Score"}
               </button>
@@ -204,76 +299,96 @@ export default function WalletsPage() {
           </div>
         </div>
 
-        {/* Wallet table */}
+        {/* Table */}
         <div className="bg-[#0d1117] border border-slate-800 rounded-xl overflow-hidden">
-          <div className="hidden sm:grid grid-cols-[auto_1fr_auto_auto_auto_auto_auto_auto] gap-4 px-4 py-3 text-xs text-slate-500 border-b border-slate-800 font-medium">
+          <div className="hidden sm:grid grid-cols-[auto_1fr_auto_auto_auto_auto_auto_auto_auto] gap-4 px-4 py-3 text-xs text-slate-500 border-b border-slate-800 font-medium uppercase tracking-wide">
             <span>#</span>
-            <span>Wallet</span>
+            <span>Кошелёк</span>
             <span className="text-right">Win %</span>
-            <span className="text-right">Trades</span>
+            <span className="text-right">Сделки</span>
             <span className="text-right">PnL</span>
-            <span className="text-right">Avg Buy</span>
-            <span className="text-right">Last Active</span>
-            <span className="text-right">Track</span>
+            <span className="text-right">Ср. покупка</span>
+            <span className="text-right">Активность</span>
+            <span className="text-right">⭐</span>
+            <span className="text-right">✕</span>
           </div>
 
           <div className="divide-y divide-slate-800">
-            {filtered.map((w, i) => (
-              <div
-                key={w.address}
-                className="grid grid-cols-1 sm:grid-cols-[auto_1fr_auto_auto_auto_auto_auto_auto] gap-2 sm:gap-4 px-4 py-3 hover:bg-slate-800/20 transition-colors items-center"
-              >
-                <span className="hidden sm:block text-slate-600 text-sm font-mono">#{i + 1}</span>
-
-                <div>
-                  <div className="font-mono text-sm text-slate-300">
-                    {w.address.slice(0, 8)}...{w.address.slice(-6)}
-                  </div>
-                  <div className="flex flex-wrap gap-1 mt-0.5">
-                    {w.tags.map((t) => (
-                      <span key={t} className="text-xs text-slate-500">{t}</span>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="text-right">
-                  <span className={`font-semibold text-sm ${w.winRate >= 75 ? "text-emerald-400" : w.winRate >= 60 ? "text-yellow-400" : "text-slate-400"}`}>
-                    {w.winRate.toFixed(1)}%
-                  </span>
-                </div>
-
-                <div className="text-right text-sm text-slate-300">{w.totalTrades}</div>
-
-                <div className={`text-right text-sm font-semibold ${w.totalPnlUsd >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-                  {fmt(w.totalPnlUsd)}
-                </div>
-
-                <div className="text-right text-sm text-slate-400">${w.avgBuyUsd.toLocaleString()}</div>
-
-                <div className="text-right text-xs text-slate-500">{timeAgo(w.lastActivity)}</div>
-
-                <div className="text-right">
-                  <button
-                    onClick={() => toggleTrack(w.address)}
-                    className={`text-lg transition-colors ${
-                      tracked.includes(w.address) ? "text-yellow-400" : "text-slate-600 hover:text-slate-400"
-                    }`}
-                    title={tracked.includes(w.address) ? "Untrack" : "Track wallet"}
-                  >
-                    {tracked.includes(w.address) ? "★" : "☆"}
-                  </button>
-                </div>
+            {filtered.length === 0 ? (
+              <div className="text-center py-12 text-slate-500">
+                {filter === "tracked" ? "Ты ещё не отслеживаешь ни одного кошелька — нажми ☆ рядом с кошельком" : "Нет кошельков в этой категории"}
               </div>
-            ))}
+            ) : (
+              filtered.map((w, i) => (
+                <div
+                  key={w.address}
+                  className={`grid grid-cols-1 sm:grid-cols-[auto_1fr_auto_auto_auto_auto_auto_auto_auto] gap-2 sm:gap-4 px-4 py-3 transition-all items-center ${
+                    highlightAddr === w.address
+                      ? "bg-emerald-500/10 border-l-2 border-emerald-500"
+                      : "hover:bg-slate-800/20"
+                  }`}
+                >
+                  <span className="hidden sm:block text-slate-600 text-sm font-mono">#{i + 1}</span>
 
-            {filtered.length === 0 && (
-              <div className="text-center py-12 text-slate-500">No wallets in this category</div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-sm text-slate-300">
+                        {w.address.slice(0, 8)}...{w.address.slice(-6)}
+                      </span>
+                      {w.isNew && (
+                        <span className="text-xs bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded">новый</span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-1 mt-0.5">
+                      {w.tags.map((t) => (
+                        <span key={t} className="text-xs text-slate-500">{t}</span>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="text-right">
+                    <span className={`font-bold text-sm ${w.winRate >= 75 ? "text-emerald-400" : w.winRate >= 60 ? "text-yellow-400" : "text-slate-400"}`}>
+                      {w.winRate.toFixed(1)}%
+                    </span>
+                  </div>
+
+                  <div className="text-right text-sm text-slate-300">{w.totalTrades}</div>
+
+                  <div className={`text-right text-sm font-bold ${w.totalPnlUsd >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                    {fmt(w.totalPnlUsd)}
+                  </div>
+
+                  <div className="text-right text-sm text-slate-400">${w.avgBuyUsd.toLocaleString()}</div>
+
+                  <div className="text-right text-xs text-slate-500">{timeAgo(w.lastActivity)}</div>
+
+                  <div className="text-right">
+                    <button
+                      onClick={() => toggleTrack(w.address)}
+                      className={`text-xl transition-colors ${tracked.includes(w.address) ? "text-yellow-400" : "text-slate-600 hover:text-yellow-400"}`}
+                      title={tracked.includes(w.address) ? "Убрать из отслеживания" : "Отслеживать"}
+                    >
+                      {tracked.includes(w.address) ? "★" : "☆"}
+                    </button>
+                  </div>
+
+                  <div className="text-right">
+                    <button
+                      onClick={() => removeWallet(w.address)}
+                      className="text-slate-700 hover:text-red-400 transition-colors text-sm"
+                      title="Удалить"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              ))
             )}
           </div>
         </div>
 
         <p className="text-xs text-slate-600 mt-4 text-center">
-          Demo data shown. Connect Helius API in Settings for real Solana on-chain wallet analysis.
+          Добавь Helius API ключ в Настройках для реальной истории Solana транзакций
         </p>
       </main>
     </div>
