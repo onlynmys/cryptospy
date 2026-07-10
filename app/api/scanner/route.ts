@@ -355,6 +355,7 @@ const SCAN_TTL = 3 * 60 * 1000;
 
 export async function GET(req: NextRequest) {
   const apiKey = process.env.HELIUS_API_KEY;
+  const mode = req.nextUrl.searchParams.get("mode");
   const forceRefresh = req.nextUrl.searchParams.get("refresh") === "1";
 
   if (!apiKey) {
@@ -363,6 +364,28 @@ export async function GET(req: NextRequest) {
       real: false,
       hasApiKey: false,
       message: "Добавь Helius API ключ в Settings для реального сканирования",
+    });
+  }
+
+  // Cached mode: return last scan results WITHOUT touching Helius (0 credits)
+  if (mode === "cached") {
+    if (lastGoodScan) {
+      return NextResponse.json({
+        wallets: lastGoodScan.wallets,
+        real: true,
+        hasApiKey: true,
+        cached: true,
+        scannedPairs: lastGoodScan.scannedPairs,
+        scannedWallets: lastGoodScan.scannedWallets,
+        lastScanTs: lastGoodScan.ts,
+      });
+    }
+    return NextResponse.json({
+      wallets: [],
+      real: true,
+      hasApiKey: true,
+      cached: true,
+      message: "Нажми «Сканировать» чтобы найти прибыльные кошельки",
     });
   }
 
@@ -377,6 +400,9 @@ export async function GET(req: NextRequest) {
     });
   }
 
+  const scanStart = Date.now();
+  let heliusRequests = 0;
+
   try {
     const [solPrice, pairs] = await Promise.all([getSolPrice(), getActivePairs()]);
 
@@ -384,9 +410,10 @@ export async function GET(req: NextRequest) {
       return respondWithFallback("Нет активных пар для сканирования");
     }
 
-    const pairTxLists = await pool(pairs, 3, (p) =>
-      heliusFetch(`${HELIUS}/addresses/${p.pairAddress}/transactions?api-key=${apiKey}&type=SWAP&limit=100`)
-    );
+    const pairTxLists = await pool(pairs, 3, (p) => {
+      heliusRequests++;
+      return heliusFetch(`${HELIUS}/addresses/${p.pairAddress}/transactions?api-key=${apiKey}&type=SWAP&limit=100`);
+    });
 
     const walletBuys = new Map<string, RecentBuy[]>();
 
@@ -436,22 +463,25 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    const walletTxLists = await pool(toFetch, 3, (addr) =>
-      heliusFetch(`${HELIUS}/addresses/${addr}/transactions?api-key=${apiKey}&type=SWAP&limit=100`)
-    );
+    const walletTxLists = await pool(toFetch, 3, (addr) => {
+      heliusRequests++;
+      return heliusFetch(`${HELIUS}/addresses/${addr}/transactions?api-key=${apiKey}&type=SWAP&limit=100`);
+    });
 
     const pendingWallets: { addr: string; stats: ReturnType<typeof analyzeWallet> }[] = [];
+    let rejectedCount = 0;
 
     toFetch.forEach((addr, i) => {
       const txns = walletTxLists[i] || [];
-      if (txns.length < 2) return;
+      if (txns.length < 2) { rejectedCount++; return; }
 
       const stats = analyzeWallet(txns, addr, solPrice);
       const totalTrades = stats.wins + stats.losses;
-      if (totalTrades < 1) return;
+      if (totalTrades < 1) { rejectedCount++; return; }
 
       const winRate = Math.round((stats.wins / totalTrades) * 100);
-      if (stats.totalPnlUsd <= 0 && winRate < 50) return;
+      // Strict filter: only profitable wallets with decent win rate
+      if (stats.totalPnlUsd <= 0 || winRate < 60) { rejectedCount++; return; }
 
       pendingWallets.push({ addr, stats });
     });
@@ -509,13 +539,19 @@ export async function GET(req: NextRequest) {
       results.push(wallet);
     }
 
-    const sorted = results.sort((a, b) => b.score - a.score).slice(0, 20);
+    // Keep only wallets passing the strict filter (also re-check cached ones)
+    const passing = results.filter((w) => w.totalPnlUsd > 0 && w.winRate >= 60);
+    const sorted = passing.sort((a, b) => b.score - a.score).slice(0, 20);
 
     let finalList = sorted;
     if (lastGoodScan) {
       const have = new Set(sorted.map((w) => w.address));
       const carryOver = lastGoodScan.wallets.filter(
-        (w) => !have.has(w.address) && Date.now() / 1000 - w.lastActivity < 6 * 3600
+        (w) =>
+          !have.has(w.address) &&
+          w.totalPnlUsd > 0 &&
+          w.winRate >= 60 &&
+          Date.now() / 1000 - w.lastActivity < 6 * 3600
       );
       finalList = [...sorted, ...carryOver].sort((a, b) => b.score - a.score).slice(0, 25);
     }
@@ -529,16 +565,30 @@ export async function GET(req: NextRequest) {
       };
     }
 
+    const scanInfo = {
+      scannedPairs: pairs.length,
+      scannedWallets: candidates.length,
+      passedFilter: passing.length,
+      rejected: rejectedCount,
+      heliusRequests,
+      durationSec: Math.round((Date.now() - scanStart) / 1000),
+    };
+
     if (!finalList.length) {
-      return respondWithFallback("Сканирование не нашло подходящих кошельков — попробуй через пару минут");
+      return NextResponse.json({
+        wallets: [],
+        real: true,
+        hasApiKey: true,
+        ...scanInfo,
+        message: `Проверено ${candidates.length} кошельков — ни один не прошёл фильтр (PnL > 0 и Win Rate ≥ 60%). Попробуй позже, когда на рынке будет больше активности.`,
+      });
     }
 
     return NextResponse.json({
       wallets: finalList,
       real: true,
       hasApiKey: true,
-      scannedPairs: pairs.length,
-      scannedWallets: candidates.length,
+      ...scanInfo,
     });
   } catch (e) {
     console.error("Scanner error:", e);

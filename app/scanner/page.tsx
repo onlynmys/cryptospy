@@ -270,33 +270,55 @@ function WalletRow({ wallet, onCopy }: { wallet: SmartWallet; onCopy: (addr: str
   );
 }
 
+interface ScanMeta {
+  real: boolean;
+  hasApiKey: boolean;
+  message?: string;
+  cached?: boolean;
+  scannedPairs?: number;
+  scannedWallets?: number;
+  passedFilter?: number;
+  rejected?: number;
+  heliusRequests?: number;
+  durationSec?: number;
+  lastScanTs?: number;
+}
+
 export default function ScannerPage() {
   const [wallets, setWallets] = useState<SmartWallet[]>([]);
   const [loading, setLoading] = useState(false);
-  const [meta, setMeta] = useState<{ real: boolean; hasApiKey: boolean; message?: string; scannedPairs?: number; scannedWallets?: number } | null>(null);
+  const [meta, setMeta] = useState<ScanMeta | null>(null);
   const [lastScan, setLastScan] = useState<Date | null>(null);
   const [copied, setCopied] = useState(false);
   const [sortBy, setSortBy] = useState<"score" | "winRate" | "pnl">("score");
   const [filterTag, setFilterTag] = useState("");
 
-  const scan = useCallback(async (force = false) => {
+  // Manual scan — the only thing that spends Helius credits
+  const scan = useCallback(async () => {
     setLoading(true);
     try {
-      const r = await fetch(`/api/scanner${force ? "?refresh=1" : ""}`);
+      const r = await fetch(`/api/scanner?refresh=1`);
       const d = await r.json();
       setWallets(d.wallets || []);
-      setMeta({ real: d.real, hasApiKey: d.hasApiKey, message: d.message, scannedPairs: d.scannedPairs, scannedWallets: d.scannedWallets });
+      setMeta(d);
       setLastScan(new Date());
     } finally {
       setLoading(false);
     }
   }, []);
 
+  // On page load: show cached results only, zero Helius requests
   useEffect(() => {
-    scan();
-    const interval = setInterval(() => scan(), 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, [scan]);
+    (async () => {
+      try {
+        const r = await fetch(`/api/scanner?mode=cached`);
+        const d = await r.json();
+        setWallets(d.wallets || []);
+        setMeta(d);
+        if (d.lastScanTs) setLastScan(new Date(d.lastScanTs));
+      } catch { /* ignore */ }
+    })();
+  }, []);
 
   function copyAddr(addr: string) {
     navigator.clipboard?.writeText(addr);
@@ -330,12 +352,11 @@ export default function ScannerPage() {
           <div>
             <h1 className="text-2xl font-bold text-white flex items-center gap-2">🧠 Smart Money Scanner</h1>
             <p className="text-slate-500 text-sm mt-1">
-              Автоматически находит кошельки которые торгуют в плюс на Solana DEX
+              Находит кошельки с PnL &gt; 0 и Win Rate ≥ 60% на Solana DEX
             </p>
             {lastScan && (
               <p className="text-slate-600 text-xs mt-1">
-                Скан: {lastScan.toLocaleTimeString()}
-                {meta?.scannedPairs && ` · ${meta.scannedPairs} пар, ${meta.scannedWallets} кошельков проверено`}
+                Последний скан: {lastScan.toLocaleTimeString()}
               </p>
             )}
           </div>
@@ -345,12 +366,12 @@ export default function ScannerPage() {
               <span className={`text-xs px-2 py-1 rounded-full font-medium flex items-center gap-1.5 ${
                 meta.real ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-slate-800 text-slate-500"
               }`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${meta.real ? "bg-emerald-400 animate-pulse" : "bg-slate-600"}`} />
+                <span className={`w-1.5 h-1.5 rounded-full ${meta.real ? "bg-emerald-400" : "bg-slate-600"}`} />
                 {meta.real ? "On-chain данные" : "Демо режим"}
               </span>
             )}
             <button
-              onClick={() => scan(true)}
+              onClick={scan}
               disabled={loading}
               className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-black font-semibold rounded-xl text-sm transition-all flex items-center gap-2"
             >
@@ -360,6 +381,20 @@ export default function ScannerPage() {
             </button>
           </div>
         </div>
+
+        {/* Scan report */}
+        {meta && !meta.cached && meta.heliusRequests !== undefined && (
+          <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-3 mb-4">
+            <div className="text-xs text-slate-500 font-medium uppercase tracking-wide mb-2">Отчёт сканирования</div>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-sm">
+              <div><span className="text-slate-500">Пар просканировано: </span><span className="text-white font-semibold">{meta.scannedPairs}</span></div>
+              <div><span className="text-slate-500">Кошельков проверено: </span><span className="text-white font-semibold">{meta.scannedWallets}</span></div>
+              <div><span className="text-slate-500">Прошли фильтр: </span><span className="text-emerald-400 font-semibold">{meta.passedFilter}</span></div>
+              <div><span className="text-slate-500">Запросов Helius: </span><span className="text-yellow-400 font-semibold">{meta.heliusRequests}</span></div>
+              <div><span className="text-slate-500">Время: </span><span className="text-white font-semibold">{meta.durationSec}с</span></div>
+            </div>
+          </div>
+        )}
 
         {/* Message from API */}
         {meta?.message && meta.hasApiKey && (
@@ -466,7 +501,7 @@ export default function ScannerPage() {
         )}
 
         <p className="text-xs text-slate-600 text-center mt-6">
-          Нажми на кошелёк для детальной статистики и истории позиций · Автообновление каждые 5 минут
+          Нажми на кошелёк для детальной статистики · Сканирование запускается только вручную (~30-35 запросов Helius за скан)
         </p>
       </main>
     </div>
