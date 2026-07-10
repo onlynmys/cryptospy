@@ -1,115 +1,191 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const BASE = "https://api.dexscreener.com";
+const HELIUS_BASE = "https://api.helius.xyz/v0";
+const DEX_BASE = "https://api.dexscreener.com";
 
-export async function GET(req: NextRequest) {
-  const chain = req.nextUrl.searchParams.get("chain") || "solana";
-  const pairAddress = req.nextUrl.searchParams.get("pair");
+interface HeliusTx {
+  signature: string;
+  timestamp: number;
+  feePayer: string;
+  type: string;
+  tokenTransfers?: {
+    mint: string;
+    fromUserAccount: string;
+    toUserAccount: string;
+    tokenAmount: number;
+  }[];
+  nativeTransfers?: {
+    fromUserAccount: string;
+    toUserAccount: string;
+    amount: number;
+  }[];
+  accountData?: { account: string }[];
+}
 
-  try {
-    if (!pairAddress) {
-      return NextResponse.json({ wallets: [], error: "pair required" });
+interface TraderStats {
+  address: string;
+  shortAddress: string;
+  buys: number;
+  sells: number;
+  totalBuyUsd: number;
+  totalSellUsd: number;
+  pnlUsd: number;
+  winRate: number;
+  totalTrades: number;
+  avgBuyUsd: number;
+  lastActivity: number;
+  score: number;
+  tags: string[];
+}
+
+function shortAddr(addr: string) {
+  return addr.slice(0, 6) + "..." + addr.slice(-4);
+}
+
+function getTags(winRate: number, pnl: number, avgBuy: number, trades: number): string[] {
+  const tags: string[] = [];
+  if (winRate >= 75) tags.push("🎯 Smart Money");
+  if (winRate >= 85) tags.push("🔥 Top Trader");
+  if (pnl > 50000) tags.push("💎 Whale");
+  if (trades > 100) tags.push("⚡ Active");
+  if (avgBuy < 500 && pnl > 5000) tags.push("🚀 Sniper");
+  if (tags.length === 0) tags.push("👤 Regular");
+  return tags;
+}
+
+async function getRealTradersFromHelius(
+  pairAddress: string,
+  tokenAddress: string,
+  priceUsd: number,
+  apiKey: string
+): Promise<TraderStats[]> {
+  // Fetch recent swap transactions for this pair
+  const url = `${HELIUS_BASE}/addresses/${pairAddress}/transactions?api-key=${apiKey}&type=SWAP&limit=100`;
+  const r = await fetch(url);
+  if (!r.ok) return [];
+
+  const txns: HeliusTx[] = await r.json();
+  if (!Array.isArray(txns) || txns.length === 0) return [];
+
+  // Group by trader (feePayer)
+  const traderMap = new Map<string, { buys: { usd: number; ts: number }[]; sells: { usd: number; ts: number }[] }>();
+
+  for (const tx of txns) {
+    const maker = tx.feePayer;
+    if (!maker) continue;
+
+    if (!traderMap.has(maker)) {
+      traderMap.set(maker, { buys: [], sells: [] });
     }
+    const trader = traderMap.get(maker)!;
 
-    // Fetch pair data including recent transactions
-    const r = await fetch(`${BASE}/latest/dex/pairs/${chain}/${pairAddress}`, {
-      next: { revalidate: 15 },
-    });
+    // Determine buy or sell based on token transfers
+    const transfers = tx.tokenTransfers || [];
+    const tokenIn = transfers.find((t) => t.mint === tokenAddress && t.toUserAccount === maker);
+    const tokenOut = transfers.find((t) => t.mint === tokenAddress && t.fromUserAccount === maker);
 
-    if (!r.ok) return NextResponse.json({ wallets: [], error: "not found" });
-    const d = await r.json();
-    const pairData = d.pair;
+    // Estimate USD value from native SOL transfers (1 SOL ≈ $170 approximate, but use relative)
+    const solTransfers = tx.nativeTransfers || [];
+    const solAmount = solTransfers.reduce((s, t) => s + (t.fromUserAccount === maker ? t.amount : 0), 0) / 1e9;
+    const usdEst = solAmount * 170; // rough SOL price estimate
 
-    if (!pairData) return NextResponse.json({ wallets: [], error: "pair not found" });
-
-    // DEX Screener doesn't expose individual trade makers in their public API
-    // We return the pair data with aggregated metrics
-    const txns = pairData.txns || {};
-    const h1 = txns.h1 || { buys: 0, sells: 0 };
-    const h24 = txns.h24 || { buys: 0, sells: 0 };
-
-    return NextResponse.json({
-      pair: {
-        symbol: pairData.baseToken?.symbol,
-        priceUsd: pairData.priceUsd,
-        priceChange: pairData.priceChange,
-        volume: pairData.volume,
-        liquidity: pairData.liquidity,
-        txns: { h1, h24 },
-        pairCreatedAt: pairData.pairCreatedAt,
-      },
-      // Simulated wallet analysis based on real pair data
-      wallets: generateSmartWallets(pairData),
-    });
-  } catch (e) {
-    console.error(e);
-    return NextResponse.json({ wallets: [], error: "server error" });
+    if (tokenIn) {
+      trader.buys.push({ usd: usdEst || tokenIn.tokenAmount * priceUsd, ts: tx.timestamp });
+    } else if (tokenOut) {
+      trader.sells.push({ usd: usdEst || tokenOut.tokenAmount * priceUsd, ts: tx.timestamp });
+    }
   }
-}
 
-interface PairData {
-  volume?: { h24?: number; h1?: number };
-  priceChange?: { h24?: number; h1?: number };
-  liquidity?: { usd?: number };
-  txns?: {
-    h24?: { buys?: number; sells?: number };
-    h1?: { buys?: number; sells?: number };
-  };
-  baseToken?: { symbol?: string; address?: string };
-  pairCreatedAt?: number;
-}
+  const results: TraderStats[] = [];
 
-function generateSmartWallets(pair: PairData) {
-  const vol24 = pair.volume?.h24 || 10000;
-  const priceChange = pair.priceChange?.h24 || 0;
+  for (const [address, data] of traderMap.entries()) {
+    if (data.buys.length === 0) continue;
 
-  // Generate realistic looking wallet analysis based on real pair metrics
-  const wallets = [];
-  const count = Math.min(Math.floor(vol24 / 5000) + 3, 15);
+    const totalBuyUsd = data.buys.reduce((s, t) => s + t.usd, 0);
+    const totalSellUsd = data.sells.reduce((s, t) => s + t.usd, 0);
+    const pnl = totalSellUsd - totalBuyUsd;
+    const trades = data.buys.length + data.sells.length;
+    const winRate = data.sells.length > 0
+      ? Math.round((data.sells.filter((s) => s.usd > 0).length / Math.max(trades, 1)) * 100)
+      : 0;
+    const avgBuy = totalBuyUsd / Math.max(data.buys.length, 1);
+    const lastActivity = Math.max(
+      ...data.buys.map((t) => t.ts),
+      ...data.sells.map((t) => t.ts)
+    );
+    const score = Math.floor(
+      winRate * 0.4 +
+      Math.min(Math.log10(Math.max(Math.abs(pnl), 1)) * 5, 30) +
+      Math.min(trades / 5, 20)
+    );
 
-  for (let i = 0; i < count; i++) {
-    const winRate = 0.55 + Math.random() * 0.4;
-    const trades = Math.floor(50 + Math.random() * 400);
-    const avgBuy = vol24 / count / trades * 10;
-    const pnl = priceChange > 0
-      ? avgBuy * trades * (priceChange / 100) * (winRate - 0.3)
-      : avgBuy * trades * (Math.random() - 0.7);
-
-    const addr = generateAddress(i);
-    wallets.push({
-      address: addr,
-      shortAddress: addr.slice(0, 6) + "..." + addr.slice(-4),
-      winRate: Math.round(winRate * 1000) / 10,
+    results.push({
+      address,
+      shortAddress: shortAddr(address),
+      buys: data.buys.length,
+      sells: data.sells.length,
+      totalBuyUsd: Math.round(totalBuyUsd),
+      totalSellUsd: Math.round(totalSellUsd),
+      pnlUsd: Math.round(pnl),
+      winRate,
       totalTrades: trades,
-      totalPnlUsd: Math.round(pnl),
       avgBuyUsd: Math.round(avgBuy),
-      lastActivity: Math.floor(Date.now() / 1000) - Math.floor(Math.random() * 86400),
-      score: Math.floor(winRate * 40 + Math.min(Math.log10(Math.max(Math.abs(pnl), 1)) * 5, 30) + trades / 10),
+      lastActivity,
+      score,
       tags: getTags(winRate, pnl, avgBuy, trades),
     });
   }
 
-  return wallets.sort((a, b) => b.score - a.score).slice(0, 12);
+  return results.sort((a, b) => b.score - a.score).slice(0, 15);
 }
 
-function generateAddress(seed: number) {
-  const chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  let result = "";
-  let s = seed * 6364136223846793005 + 1442695040888963407;
-  for (let i = 0; i < 44; i++) {
-    s = (s * 1103515245 + 12345) & 0x7fffffff;
-    result += chars[Math.abs(s) % chars.length];
+export async function GET(req: NextRequest) {
+  const chain = req.nextUrl.searchParams.get("chain") || "solana";
+  const pairAddress = req.nextUrl.searchParams.get("pair");
+  const apiKey = process.env.HELIUS_API_KEY;
+
+  if (!pairAddress) {
+    return NextResponse.json({ wallets: [], error: "pair required", hasApiKey: !!apiKey });
   }
-  return result;
-}
 
-function getTags(winRate: number, pnl: number, avgBuy: number, trades: number) {
-  const tags = [];
-  if (winRate >= 0.75) tags.push("🎯 Smart Money");
-  if (winRate >= 0.85) tags.push("🔥 Top Trader");
-  if (pnl > 100000) tags.push("💎 Whale");
-  if (trades > 200) tags.push("⚡ Active");
-  if (avgBuy < 500 && pnl > 10000) tags.push("🚀 Sniper");
-  if (tags.length === 0) tags.push("👤 Regular");
-  return tags;
+  // Get pair data from DEX Screener first
+  let tokenAddress = "";
+  let priceUsd = 0;
+
+  try {
+    const r = await fetch(`${DEX_BASE}/latest/dex/pairs/${chain}/${pairAddress}`, {
+      next: { revalidate: 30 },
+    });
+    if (r.ok) {
+      const d = await r.json();
+      tokenAddress = d.pair?.baseToken?.address || "";
+      priceUsd = parseFloat(d.pair?.priceUsd || "0");
+    }
+  } catch {
+    // ignore
+  }
+
+  // Real data via Helius (Solana only)
+  if (apiKey && chain === "solana" && pairAddress) {
+    try {
+      const traders = await getRealTradersFromHelius(pairAddress, tokenAddress, priceUsd, apiKey);
+      if (traders.length > 0) {
+        return NextResponse.json({ wallets: traders, real: true, hasApiKey: true });
+      }
+    } catch (e) {
+      console.error("Helius error:", e);
+    }
+  }
+
+  // No real data available — return empty with info
+  return NextResponse.json({
+    wallets: [],
+    real: false,
+    hasApiKey: !!apiKey,
+    message: chain === "solana"
+      ? apiKey
+        ? "Нет данных о сделках для этой пары"
+        : "Добавь Helius API ключ в Settings для реального анализа трейдеров"
+      : "Анализ кошельков доступен только для Solana (через Helius API)",
+  });
 }

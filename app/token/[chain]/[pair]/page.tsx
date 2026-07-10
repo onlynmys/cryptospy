@@ -117,6 +117,7 @@ export default function TokenPage({ params }: PageProps) {
 
   const [pairData, setPairData] = useState<PairData | null>(null);
   const [wallets, setWallets] = useState<Wallet[]>([]);
+  const [walletMeta, setWalletMeta] = useState<{ real: boolean; hasApiKey: boolean; message?: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [walletLoading, setWalletLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<"wallets" | "info">("wallets");
@@ -138,6 +139,7 @@ export default function TokenPage({ params }: PageProps) {
       const r = await fetch(`/api/wallets?chain=${chain}&pair=${pair}`);
       const d = await r.json();
       setWallets(d.wallets || []);
+      setWalletMeta({ real: d.real ?? false, hasApiKey: d.hasApiKey ?? false, message: d.message });
     } finally {
       setWalletLoading(false);
     }
@@ -311,11 +313,17 @@ export default function TokenPage({ params }: PageProps) {
           <div>
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-white">
-                Active Traders on This Pair
+                Трейдеры на этой паре
               </h2>
-              <span className="text-xs text-slate-500 bg-slate-800 px-2 py-1 rounded">
-                Based on recent 24h activity
-              </span>
+              {walletMeta && wallets.length > 0 && (
+                <span className={`text-xs px-2 py-1 rounded font-medium ${
+                  walletMeta.real
+                    ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                    : "bg-slate-800 text-slate-500"
+                }`}>
+                  {walletMeta.real ? "✓ Реальные on-chain данные" : "Нет данных"}
+                </span>
+              )}
             </div>
 
             {walletLoading ? (
@@ -332,7 +340,40 @@ export default function TokenPage({ params }: PageProps) {
                 ))}
               </div>
             ) : wallets.length === 0 ? (
-              <div className="text-center py-12 text-slate-500">No wallet data available</div>
+              <div className="flex flex-col items-center py-16 gap-4">
+                <div className="text-4xl">🔍</div>
+                <div className="text-slate-300 font-medium text-lg text-center">
+                  {walletMeta?.message || "Нет данных о трейдерах"}
+                </div>
+                {!walletMeta?.hasApiKey && chain === "solana" && (
+                  <div className="flex flex-col items-center gap-3">
+                    <p className="text-slate-500 text-sm text-center max-w-sm">
+                      Для анализа реальных кошельков которые торговали этим токеном нужен Helius API ключ
+                    </p>
+                    <div className="flex gap-2">
+                      <a
+                        href="https://helius.dev"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-4 py-2 bg-emerald-500 text-black font-semibold rounded-xl text-sm hover:bg-emerald-400 transition-colors"
+                      >
+                        Получить ключ бесплатно →
+                      </a>
+                      <Link
+                        href="/settings"
+                        className="px-4 py-2 border border-slate-700 text-slate-300 rounded-xl text-sm hover:border-slate-500 transition-colors"
+                      >
+                        Настройки
+                      </Link>
+                    </div>
+                  </div>
+                )}
+                {chain !== "solana" && (
+                  <p className="text-slate-500 text-sm text-center max-w-sm">
+                    Анализ кошельков сейчас доступен только для Solana токенов
+                  </p>
+                )}
+              </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {wallets.map((w, i) => (
