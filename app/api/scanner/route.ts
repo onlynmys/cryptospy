@@ -180,18 +180,18 @@ async function getActivePairs(): Promise<TrendingPair[]> {
       for (const p of (d.pairs || []) as {
         chainId: string; pairAddress: string;
         baseToken: { symbol: string; address: string };
-        volume?: { h1?: number }; priceChange?: { h1?: number };
+        volume?: { h1?: number; h24?: number }; priceChange?: { h1?: number };
         liquidity?: { usd?: number };
       }[]) {
         if (p.chainId !== "solana") continue;
         if ((p.liquidity?.usd || 0) < 3000) continue;
-        if ((p.volume?.h1 || 0) < 500) continue;
+        if ((p.volume?.h24 || 0) < 5000) continue;
         pairs.push({
           pairAddress: p.pairAddress,
           tokenSymbol: p.baseToken.symbol,
           tokenAddress: p.baseToken.address,
           priceChange1h: p.priceChange?.h1 || 0,
-          volumeH1: p.volume?.h1 || 0,
+          volumeH1: p.volume?.h24 || 0,
         });
         if (p.baseToken?.address && p.baseToken?.symbol) {
           symbolCache.set(p.baseToken.address, p.baseToken.symbol);
@@ -204,7 +204,7 @@ async function getActivePairs(): Promise<TrendingPair[]> {
   return pairs
     .filter((p) => !seen.has(p.pairAddress) && seen.add(p.pairAddress))
     .sort((a, b) => b.volumeH1 - a.volumeH1)
-    .slice(0, 8);
+    .slice(0, 10);
 }
 
 // ---------- wallet analysis ----------
@@ -417,10 +417,13 @@ export async function GET(req: NextRequest) {
 
     const walletBuys = new Map<string, RecentBuy[]>();
 
+    const DAY_AGO = Date.now() / 1000 - 24 * 3600;
+
     pairs.forEach((pair, i) => {
       for (const tx of pairTxLists[i] || []) {
         const maker = tx.feePayer;
         if (!maker || maker.length < 32) continue;
+        if (tx.timestamp < DAY_AGO) continue; // only wallets active in last 24h
 
         const swap = extractSwap(tx, maker, solPrice);
         if (!swap || swap.side !== "buy" || swap.usd < 20) continue;
@@ -447,7 +450,7 @@ export async function GET(req: NextRequest) {
         const bScore = b[1].length * 1000 + Math.max(...b[1].map((x) => x.buyAmountUsd));
         return bScore - aScore;
       })
-      .slice(0, 25)
+      .slice(0, 40)
       .map(([addr]) => addr);
 
     const results: SmartWallet[] = [];
@@ -480,8 +483,9 @@ export async function GET(req: NextRequest) {
       if (totalTrades < 1) { rejectedCount++; return; }
 
       const winRate = Math.round((stats.wins / totalTrades) * 100);
-      // Strict filter: only profitable wallets with decent win rate
-      if (stats.totalPnlUsd <= 0 || winRate < 60) { rejectedCount++; return; }
+      // Strict filter: PnL >= $800, Win Rate >= 60%, active in last 24h
+      const activeRecently = Date.now() / 1000 - stats.lastActivity < 24 * 3600;
+      if (stats.totalPnlUsd < 800 || winRate < 60 || !activeRecently) { rejectedCount++; return; }
 
       pendingWallets.push({ addr, stats });
     });
@@ -540,20 +544,17 @@ export async function GET(req: NextRequest) {
     }
 
     // Keep only wallets passing the strict filter (also re-check cached ones)
-    const passing = results.filter((w) => w.totalPnlUsd > 0 && w.winRate >= 60);
-    const sorted = passing.sort((a, b) => b.score - a.score).slice(0, 20);
+    const passesFilter = (w: SmartWallet) =>
+      w.totalPnlUsd >= 800 && w.winRate >= 60 && Date.now() / 1000 - w.lastActivity < 24 * 3600;
+
+    const passing = results.filter(passesFilter);
+    const sorted = passing.sort((a, b) => b.score - a.score).slice(0, 40);
 
     let finalList = sorted;
     if (lastGoodScan) {
       const have = new Set(sorted.map((w) => w.address));
-      const carryOver = lastGoodScan.wallets.filter(
-        (w) =>
-          !have.has(w.address) &&
-          w.totalPnlUsd > 0 &&
-          w.winRate >= 60 &&
-          Date.now() / 1000 - w.lastActivity < 6 * 3600
-      );
-      finalList = [...sorted, ...carryOver].sort((a, b) => b.score - a.score).slice(0, 25);
+      const carryOver = lastGoodScan.wallets.filter((w) => !have.has(w.address) && passesFilter(w));
+      finalList = [...sorted, ...carryOver].sort((a, b) => b.score - a.score).slice(0, 50);
     }
 
     if (finalList.length > 0) {
@@ -580,7 +581,7 @@ export async function GET(req: NextRequest) {
         real: true,
         hasApiKey: true,
         ...scanInfo,
-        message: `Проверено ${candidates.length} кошельков — ни один не прошёл фильтр (PnL > 0 и Win Rate ≥ 60%). Попробуй позже, когда на рынке будет больше активности.`,
+        message: `Проверено ${candidates.length} кошельков — ни один не прошёл фильтр (PnL ≥ $800, Win Rate ≥ 60%, активность за 24ч). Попробуй позже, когда на рынке будет больше активности.`,
       });
     }
 

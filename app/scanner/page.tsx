@@ -292,6 +292,8 @@ export default function ScannerPage() {
   const [copied, setCopied] = useState(false);
   const [sortBy, setSortBy] = useState<"score" | "winRate" | "pnl">("score");
   const [filterTag, setFilterTag] = useState("");
+  const [page, setPage] = useState(1);
+  const PER_PAGE = 10;
 
   // Manual scan — the only thing that spends Helius credits
   const scan = useCallback(async () => {
@@ -302,6 +304,7 @@ export default function ScannerPage() {
       setWallets(d.wallets || []);
       setMeta(d);
       setLastScan(new Date());
+      setPage(1);
     } finally {
       setLoading(false);
     }
@@ -328,13 +331,17 @@ export default function ScannerPage() {
 
   const allTags = Array.from(new Set(wallets.flatMap((w) => w.tags)));
 
-  const displayed = wallets
+  const filtered = wallets
     .filter((w) => !filterTag || w.tags.includes(filterTag))
     .sort((a, b) => {
       if (sortBy === "winRate") return b.winRate - a.winRate;
       if (sortBy === "pnl") return b.totalPnlUsd - a.totalPnlUsd;
       return b.score - a.score;
     });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PER_PAGE));
+  const safePage = Math.min(page, totalPages);
+  const displayed = filtered.slice((safePage - 1) * PER_PAGE, safePage * PER_PAGE);
 
   return (
     <div className="min-h-screen">
@@ -352,7 +359,7 @@ export default function ScannerPage() {
           <div>
             <h1 className="text-2xl font-bold text-white flex items-center gap-2">🧠 Smart Money Scanner</h1>
             <p className="text-slate-500 text-sm mt-1">
-              Находит кошельки с PnL &gt; 0 и Win Rate ≥ 60% на Solana DEX
+              Кошельки активные за 24ч · PnL ≥ $800 · Win Rate ≥ 60%
             </p>
             {lastScan && (
               <p className="text-slate-600 text-xs mt-1">
@@ -446,12 +453,12 @@ export default function ScannerPage() {
         {wallets.length > 0 && (
           <div className="flex flex-col sm:flex-row gap-3 mb-4">
             <div className="flex gap-1 flex-wrap">
-              <button onClick={() => setFilterTag("")}
+              <button onClick={() => { setFilterTag(""); setPage(1); }}
                 className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all border ${!filterTag ? "bg-slate-700 text-white border-slate-600" : "text-slate-500 border-slate-800 hover:text-slate-300"}`}>
                 Все
               </button>
               {allTags.map((t) => (
-                <button key={t} onClick={() => setFilterTag(filterTag === t ? "" : t)}
+                <button key={t} onClick={() => { setFilterTag(filterTag === t ? "" : t); setPage(1); }}
                   className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all border ${filterTag === t ? "bg-slate-700 text-white border-slate-600" : "text-slate-500 border-slate-800 hover:text-slate-300"}`}>
                   {t}
                 </button>
@@ -493,11 +500,49 @@ export default function ScannerPage() {
         ) : displayed.length === 0 ? (
           <div className="text-center py-20 text-slate-500">Нет кошельков по фильтру</div>
         ) : (
-          <div className="space-y-2">
-            {displayed.map((w) => (
-              <WalletRow key={w.address} wallet={w} onCopy={copyAddr} />
-            ))}
-          </div>
+          <>
+            <div className="space-y-2">
+              {displayed.map((w) => (
+                <WalletRow key={w.address} wallet={w} onCopy={copyAddr} />
+              ))}
+            </div>
+
+            {/* Pagination */}
+            {totalPages > 1 && (
+              <div className="flex items-center justify-center gap-2 mt-6">
+                <button
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={safePage === 1}
+                  className="px-3 py-1.5 border border-slate-700 text-slate-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-sm transition-colors"
+                >
+                  ← Назад
+                </button>
+                {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => setPage(p)}
+                    className={`w-9 h-9 rounded-lg text-sm font-medium transition-all ${
+                      p === safePage
+                        ? "bg-emerald-500 text-black"
+                        : "border border-slate-800 text-slate-500 hover:text-white hover:border-slate-600"
+                    }`}
+                  >
+                    {p}
+                  </button>
+                ))}
+                <button
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={safePage === totalPages}
+                  className="px-3 py-1.5 border border-slate-700 text-slate-400 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-sm transition-colors"
+                >
+                  Вперёд →
+                </button>
+              </div>
+            )}
+            <div className="text-center text-xs text-slate-600 mt-2">
+              {filtered.length} кошельков · страница {safePage} из {totalPages}
+            </div>
+          </>
         )}
 
         <p className="text-xs text-slate-600 text-center mt-6">
