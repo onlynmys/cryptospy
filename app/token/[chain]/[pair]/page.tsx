@@ -9,6 +9,51 @@ interface PageProps {
   params: Promise<{ chain: string; pair: string }>;
 }
 
+function explorerUrl(address: string, chain: string): string | null {
+  const isEvm = address.startsWith("0x") && address.length === 42;
+  const isSolana = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address) && !address.startsWith("0x");
+
+  if (isEvm) {
+    const map: Record<string, string> = {
+      ethereum: `https://etherscan.io/address/${address}`,
+      bsc: `https://bscscan.com/address/${address}`,
+      base: `https://basescan.org/address/${address}`,
+      arbitrum: `https://arbiscan.io/address/${address}`,
+      polygon: `https://polygonscan.com/address/${address}`,
+    };
+    return map[chain] || `https://etherscan.io/address/${address}`;
+  }
+
+  if (isSolana || chain === "solana") {
+    return `https://solscan.io/account/${address}`;
+  }
+
+  return null;
+}
+
+function ExplorerLink({ address, chain }: { address: string; chain: string }) {
+  const url = explorerUrl(address, chain);
+
+  if (!url) {
+    return (
+      <div className="w-full text-center py-2 text-slate-600 text-xs">
+        Нет ссылки на эксплорер для этого адреса
+      </div>
+    );
+  }
+
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="block w-full text-center py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded-xl text-sm hover:bg-emerald-500/20 transition-colors"
+    >
+      ↗ Открыть в эксплорере
+    </a>
+  );
+}
+
 type Wallet = {
   address: string;
   shortAddress: string;
@@ -399,14 +444,7 @@ export default function TokenPage({ params }: PageProps) {
                 ))}
               </div>
 
-              <a
-                href={`https://solscan.io/account/${selectedWallet.address}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="block w-full text-center py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded-xl text-sm hover:bg-emerald-500/20 transition-colors"
-              >
-                ↗ View on Explorer
-              </a>
+              <ExplorerLink address={selectedWallet.address} chain={chain} />
             </div>
           </div>
         )}

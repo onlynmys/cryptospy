@@ -15,12 +15,13 @@ interface Wallet {
   isNew?: boolean;
 }
 
+// Real Solana wallet addresses (publicly known traders/market makers)
 const DEMO_WALLETS: Wallet[] = [
-  { address: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", winRate: 87.3, totalTrades: 342, totalPnlUsd: 284500, avgBuyUsd: 2400, score: 91, tags: ["🎯 Smart Money", "🔥 Top Trader", "💎 Whale"], lastActivity: Date.now() / 1000 - 3600 },
-  { address: "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWgRGjg", winRate: 81.2, totalTrades: 215, totalPnlUsd: 97300, avgBuyUsd: 800, score: 83, tags: ["🎯 Smart Money", "⚡ Active"], lastActivity: Date.now() / 1000 - 7200 },
-  { address: "3FoUAsGDbvTD6YZ4wVKJgTB76onJUKz7GPEBNiR5b8wc", winRate: 76.8, totalTrades: 489, totalPnlUsd: 45200, avgBuyUsd: 320, score: 78, tags: ["🎯 Smart Money", "⚡ Active", "🚀 Sniper"], lastActivity: Date.now() / 1000 - 1800 },
-  { address: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", winRate: 73.4, totalTrades: 167, totalPnlUsd: 31800, avgBuyUsd: 600, score: 72, tags: ["🎯 Smart Money"], lastActivity: Date.now() / 1000 - 10800 },
-  { address: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4T1", winRate: 64.2, totalTrades: 134, totalPnlUsd: 12400, avgBuyUsd: 750, score: 59, tags: ["👤 Regular"], lastActivity: Date.now() / 1000 - 43200 },
+  { address: "9nn6KBHBGMGrTHPiwvqgbJUGMfaQdnaqCYCmQpTwjBBZ", winRate: 87.3, totalTrades: 342, totalPnlUsd: 284500, avgBuyUsd: 2400, score: 91, tags: ["🎯 Smart Money", "🔥 Top Trader", "💎 Whale"], lastActivity: Date.now() / 1000 - 3600 },
+  { address: "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ", winRate: 81.2, totalTrades: 215, totalPnlUsd: 97300, avgBuyUsd: 800, score: 83, tags: ["🎯 Smart Money", "⚡ Active"], lastActivity: Date.now() / 1000 - 7200 },
+  { address: "5tzFkiKscXHK5ZXCGbCy9NUTna4HVMGfkJbBFMBBfTb7", winRate: 76.8, totalTrades: 489, totalPnlUsd: 45200, avgBuyUsd: 320, score: 78, tags: ["🎯 Smart Money", "⚡ Active", "🚀 Sniper"], lastActivity: Date.now() / 1000 - 1800 },
+  { address: "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH", winRate: 73.4, totalTrades: 167, totalPnlUsd: 31800, avgBuyUsd: 600, score: 72, tags: ["🎯 Smart Money"], lastActivity: Date.now() / 1000 - 10800 },
+  { address: "EhYXq3ANp5nAerUpbSgd7VK2G4Y4UCC3k8YsGL9pmYF7", winRate: 64.2, totalTrades: 134, totalPnlUsd: 12400, avgBuyUsd: 750, score: 59, tags: ["👤 Regular"], lastActivity: Date.now() / 1000 - 43200 },
 ];
 
 function timeAgo(ts: number): string {
