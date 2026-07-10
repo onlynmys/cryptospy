@@ -199,7 +199,7 @@ function WalletRow({ wallet, onCopy }: { wallet: SmartWallet; onCopy: (addr: str
             <>
               <div className="px-4 pt-2 pb-1 text-xs text-slate-500 font-medium uppercase tracking-wide flex items-center gap-2">
                 <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
-                Сейчас покупает (на трендовых парах)
+                Покупки за последние 24ч
               </div>
               <div className="divide-y divide-slate-800/50">
                 {wallet.recentBuys.map((buy, i) => (
@@ -214,12 +214,16 @@ function WalletRow({ wallet, onCopy }: { wallet: SmartWallet; onCopy: (addr: str
                     </div>
                     <div className="text-right shrink-0">
                       <div className="text-sm font-semibold text-slate-200">{fmtUsd(buy.buyAmountUsd)}</div>
-                      {buy.pairAddress && (
-                        <Link
-                          href={`/token/solana/${buy.pairAddress}`}
+                      {(buy.pairAddress || buy.tokenAddress) && (
+                        <a
+                          href={buy.pairAddress
+                            ? `https://dexscreener.com/solana/${buy.pairAddress}`
+                            : `https://dexscreener.com/solana/${buy.tokenAddress}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
                           className="text-xs text-slate-600 hover:text-emerald-400 transition-colors"
                           onClick={(e) => e.stopPropagation()}
-                        >график →</Link>
+                        >график →</a>
                       )}
                     </div>
                   </div>
@@ -275,7 +279,7 @@ interface ScanMeta {
   hasApiKey: boolean;
   message?: string;
   cached?: boolean;
-  scannedPairs?: number;
+  scannedSwaps?: number;
   scannedWallets?: number;
   passedFilter?: number;
   rejected?: number;
@@ -394,8 +398,8 @@ export default function ScannerPage() {
           <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-3 mb-4">
             <div className="text-xs text-slate-500 font-medium uppercase tracking-wide mb-2">Отчёт сканирования</div>
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-sm">
-              <div><span className="text-slate-500">Пар просканировано: </span><span className="text-white font-semibold">{meta.scannedPairs}</span></div>
-              <div><span className="text-slate-500">Кошельков проверено: </span><span className="text-white font-semibold">{meta.scannedWallets}</span></div>
+              <div><span className="text-slate-500">Свопов проверено: </span><span className="text-white font-semibold">{meta.scannedSwaps}</span></div>
+              <div><span className="text-slate-500">Трейдеров проверено: </span><span className="text-white font-semibold">{meta.scannedWallets}</span></div>
               <div><span className="text-slate-500">Прошли фильтр: </span><span className="text-emerald-400 font-semibold">{meta.passedFilter}</span></div>
               <div><span className="text-slate-500">Запросов Helius: </span><span className="text-yellow-400 font-semibold">{meta.heliusRequests}</span></div>
               <div><span className="text-slate-500">Время: </span><span className="text-white font-semibold">{meta.durationSec}с</span></div>
