@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo, use } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, use } from "react";
 import Link from "next/link";
 import Navbar from "@/components/Navbar";
 import { buildWalletStats, type TimedSwap } from "@/lib/scannerCore";
@@ -66,6 +66,9 @@ export default function WalletHistoryPage({ params }: PageProps) {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [tab, setTab] = useState<FilterTab>("all");
+  const [loadAmount, setLoadAmount] = useState(100);
+  const [progress, setProgress] = useState<{ done: number; target: number } | null>(null);
+  const cancelRef = useRef(false);
 
   const loadPage = useCallback(
     async (before: string | undefined, isFirst: boolean) => {
@@ -89,6 +92,44 @@ export default function WalletHistoryPage({ params }: PageProps) {
     },
     [address]
   );
+
+  // The server caps one request at 100 transactions (Alchemy free-tier
+  // pacing + Vercel's proxy timeout), so bigger depths are fetched as a
+  // client-side chain of ≤100-tx pages behind one button, with live
+  // progress and a working Stop.
+  const loadMoreSmart = useCallback(async () => {
+    if (!nextBefore || loadingMore) return;
+    cancelRef.current = false;
+    setLoadingMore(true);
+    setError(null);
+    const target = loadAmount;
+    let cursor: string | null = nextBefore;
+    let fetched = 0;
+    setProgress({ done: 0, target });
+    try {
+      while (cursor && fetched < target && !cancelRef.current) {
+        const chunk = Math.min(100, target - fetched);
+        const qs = new URLSearchParams({ wallet: address, limit: String(chunk), before: cursor });
+        const r = await fetch(`/api/wallet-history?${qs}`, { cache: "no-store" });
+        const d: { events?: WalletEvent[]; nextBefore?: string | null; hasMore?: boolean; rawTxCount?: number; error?: string } = await r.json();
+        if (!r.ok) throw new Error(d.error || "failed");
+        setEvents((prev) => [...prev, ...(d.events || [])]);
+        setRawSeen((n) => n + (d.rawTxCount || 0));
+        cursor = d.nextBefore ?? null;
+        setNextBefore(cursor);
+        setHasMore(!!d.hasMore && !!cursor);
+        if (!d.hasMore) break;
+        if (!d.rawTxCount) break; // page yielded nothing — don't spin forever
+        fetched += d.rawTxCount;
+        setProgress({ done: Math.min(fetched, target), target });
+      }
+    } catch {
+      setError("Не удалось загрузить историю — сервис сбора данных сейчас недоступен");
+    } finally {
+      setLoadingMore(false);
+      setProgress(null);
+    }
+  }, [address, nextBefore, loadingMore, loadAmount]);
 
   useEffect(() => {
     loadPage(undefined, true);
@@ -282,6 +323,57 @@ export default function WalletHistoryPage({ params }: PageProps) {
           </div>
         ) : (
           <>
+            {/* History depth control — kept at the top so deepening the
+                window doesn't require scrolling past every section first */}
+            <div className="bg-[#0d1117] border border-slate-800 rounded-xl px-4 py-3 mb-5 flex items-center gap-3 flex-wrap">
+              <span className="text-xs text-slate-400 shrink-0">Догрузить ещё:</span>
+              <div className="flex gap-1 bg-slate-900 rounded-lg p-1">
+                {[100, 200, 500, 1000].map((n) => (
+                  <button
+                    key={n}
+                    onClick={() => setLoadAmount(n)}
+                    disabled={loadingMore}
+                    className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+                      loadAmount === n ? "bg-slate-700 text-white" : "text-slate-500 hover:text-slate-300"
+                    }`}
+                  >
+                    {n} tx
+                  </button>
+                ))}
+              </div>
+              {hasMore ? (
+                loadingMore && progress ? (
+                  <div className="flex items-center gap-2 flex-1 min-w-[180px]">
+                    <button
+                      onClick={() => { cancelRef.current = true; }}
+                      className="px-3 py-1.5 bg-red-500/10 border border-red-500/30 text-red-400 rounded-lg text-xs font-medium hover:bg-red-500/20 transition-colors shrink-0"
+                    >
+                      ■ Стоп
+                    </button>
+                    <div className="flex-1 h-2 bg-slate-800 rounded-full overflow-hidden min-w-[80px]">
+                      <div
+                        className="h-full bg-emerald-400/80 rounded-full transition-all duration-300"
+                        style={{ width: `${Math.round((progress.done / progress.target) * 100)}%` }}
+                      />
+                    </div>
+                    <span className="text-xs text-slate-400 tabular-nums shrink-0">{progress.done}/{progress.target} tx</span>
+                  </div>
+                ) : (
+                  <button
+                    onClick={loadMoreSmart}
+                    className="px-4 py-1.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded-lg text-xs font-bold hover:bg-emerald-500/20 transition-colors"
+                  >
+                    ⬇ Загрузить {loadAmount} tx (≈{Math.max(Math.round((loadAmount / 100) * 22), 12)}с)
+                  </button>
+                )
+              ) : (
+                <span className="text-xs text-slate-500">✓ Вся история кошелька загружена</span>
+              )}
+              <span className="text-[11px] text-slate-600 ml-auto">
+                загружено {rawSeen} tx · {events.length} событий
+              </span>
+            </div>
+
             {/* Stats: trading */}
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-3">
               {[
@@ -470,21 +562,22 @@ export default function WalletHistoryPage({ params }: PageProps) {
               </div>
             </div>
 
-            {/* Load more */}
+            {/* Compact repeat of the top control — saves a scroll back up
+                after reading through the table */}
             <div className="flex flex-col items-center gap-2 mt-5">
               {error && events.length > 0 && <div className="text-xs text-red-400">{error}</div>}
               {hasMore ? (
                 <button
-                  onClick={() => nextBefore && loadPage(nextBefore, false)}
+                  onClick={loadMoreSmart}
                   disabled={loadingMore}
                   className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-slate-200 font-medium rounded-xl text-sm transition-colors"
                 >
-                  {loadingMore ? (
+                  {loadingMore && progress ? (
                     <span className="flex items-center gap-2">
                       <span className="w-4 h-4 border-2 border-slate-500 border-t-slate-200 rounded-full animate-spin" />
-                      Загружаю более раннюю историю...
+                      Загружаю... {progress.done}/{progress.target} tx
                     </span>
-                  ) : "Загрузить ещё историю"}
+                  ) : `⬇ Загрузить ещё ${loadAmount} tx`}
                 </button>
               ) : (
                 <div className="text-xs text-slate-600">История загружена полностью — это начало активности кошелька</div>
