@@ -112,6 +112,7 @@ export function startSolanaFeed(
               txQueue.push(sig); // 429 isn't the signature's fault — always retry after backoff
             } else {
               stats.errors++;
+              if (attempts === 1) console.error(`[solanaFeed] getTransaction(${sig.slice(0, 8)}) failed: ${(e as Error).message}`);
               if (attempts <= MAX_SIG_RETRIES) {
                 sigRetries.set(sig, attempts);
                 txQueue.push(sig);
@@ -154,6 +155,11 @@ export function startSolanaFeed(
         stats.rateLimited++;
       } else {
         stats.errors++;
+        // Errors used to be silently swallowed into a bare counter — finding
+        // this exact bug (missing env var → every request 401ing) took
+        // digging through raw pm2 env output instead of the logs, because
+        // nothing here ever printed WHY. Keep a one-line reason visible.
+        console.error(`[solanaFeed] pollProgram(${address.slice(0, 8)}) failed: ${(e as Error).message}`);
       }
     }
   }
