@@ -41,9 +41,10 @@ function getTags(winRate: number, pnl: number, avgBuy: number, trades: number): 
 function extractTokenSwap(
   tx: HeliusTx,
   tokenAddress: string,
-  solPrice: number
+  solPrice: number,
+  wallet: string
 ): { usd: number; side: "buy" | "sell" } | null {
-  const swap = extractSwap(tx, solPrice);
+  const swap = extractSwap(tx, solPrice, wallet);
   if (!swap || swap.mint !== tokenAddress) return null;
   return { usd: swap.usd, side: swap.side };
 }
@@ -68,7 +69,7 @@ async function getRealTradersFromHelius(
     const maker = tx.feePayer;
     if (!maker) continue;
 
-    const swap = extractTokenSwap(tx, tokenAddress, solPrice);
+    const swap = extractTokenSwap(tx, tokenAddress, solPrice, maker);
     if (!swap || swap.usd < 1) continue;
 
     if (!traderMap.has(maker)) traderMap.set(maker, { buys: [], sells: [] });

@@ -107,6 +107,15 @@ export interface HeliusTx {
       tokenOutputs?: { userAccount: string; mint: string; rawTokenAmount: { tokenAmount: string; decimals: number } }[];
     };
   };
+  // Per-account net balance changes for the whole transaction — the same
+  // ground-truth deltas Helius computed from the actual pre/post balances,
+  // as opposed to events.swap (see extractSwap for why that field can't be
+  // trusted).
+  accountData?: {
+    account: string;
+    nativeBalanceChange: number;
+    tokenBalanceChanges?: { mint: string; userAccount: string; rawTokenAmount: { tokenAmount: string; decimals: number } }[];
+  }[];
 }
 
 // ---------- helpers ----------
@@ -256,101 +265,72 @@ export interface ExtractedSwap {
   tokens: number;
 }
 
-const tokenAmount = (t: { rawTokenAmount: { tokenAmount: string; decimals: number } }) =>
-  Number(t.rawTokenAmount.tokenAmount) / 10 ** t.rawTokenAmount.decimals;
+// Reads the swap directly from the wallet's own balance deltas (accountData),
+// instead of trusting Helius's synthesized events.swap summary.
+//
+// events.swap looked authoritative but isn't: for Jupiter-routed multi-hop
+// swaps it can report a wildly wrong amount for the "main" leg — caught via a
+// real trade where events.swap.nativeInput said "0.005 SOL" but the wallet's
+// actual accountData.nativeBalanceChange for that same transaction was
+// -5.000016078 SOL (a ~1000x discrepancy, most likely Helius's synthesis
+// locking onto an inner sub-instruction of the route instead of the wallet's
+// real net spend). accountData is Helius's other, lower-level field — the
+// actual computed pre/post balance difference per account, the same kind of
+// ground truth extractSwapFromRaw already reads directly from raw
+// preBalances/postBalances for the free (non-Helius) feed. Trusting that
+// instead makes this function's numbers reconcilable with a block explorer.
+export function extractSwap(tx: HeliusTx, solPrice: number, wallet: string): ExtractedSwap | null {
+  const accountData = tx.accountData;
+  if (!accountData) return null;
 
-// Helius often splits ONE swap into several legs of the SAME mint (one per
-// routing hop/pool) — e.g. a single DUPE sell arrives as four tokenInputs
-// entries: 980 + 244,141 + 26,349 + 184,400. Reading just the first leg
-// undercounted quantities by orders of magnitude, so always work with
-// per-mint totals.
-function sumByMint(legs?: { mint: string; rawTokenAmount: { tokenAmount: string; decimals: number } }[]): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const t of legs || []) {
-    out.set(t.mint, (out.get(t.mint) || 0) + tokenAmount(t));
+  const nativeDelta = (accountData.find((a) => a.account === wallet)?.nativeBalanceChange || 0) / 1e9;
+
+  // Token balance changes live on the wallet's associated token accounts
+  // (different pubkeys from the wallet itself), scattered across accountData
+  // — collect every leg owned by this wallet, keyed by mint. rawTokenAmount
+  // is already a signed delta, so no separate pre/post subtraction needed.
+  const tokenDeltas = new Map<string, number>();
+  for (const a of accountData) {
+    for (const t of a.tokenBalanceChanges || []) {
+      if (t.userAccount !== wallet) continue;
+      const amt = Number(t.rawTokenAmount.tokenAmount) / 10 ** t.rawTokenAmount.decimals;
+      tokenDeltas.set(t.mint, (tokenDeltas.get(t.mint) || 0) + amt);
+    }
   }
-  return out;
-}
 
-// The traded token on the receiving/sending side: a non-stable mint that is
-// mostly NET moved in that direction. Intermediate route hops appear on both
-// sides with roughly equal totals (net ≈ 0), so requiring the majority of
-// the gross amount to be net movement filters them out.
-function pickTradedMint(gross: Map<string, number>, opposite: Map<string, number>): { mint: string; tokens: number } | null {
-  for (const [mint, total] of gross.entries()) {
+  // Some wallets trade from a wrapped-SOL token account instead of native
+  // SOL — fold it into the SOL-side delta so those trades aren't dropped.
+  const solDelta = nativeDelta + (tokenDeltas.get(WSOL) || 0);
+  const stableDelta = (tokenDeltas.get(USDC) || 0) + (tokenDeltas.get(USDT) || 0);
+
+  let bestMint: string | null = null;
+  let bestDelta = 0;
+  for (const [mint, delta] of tokenDeltas) {
     if (STABLES.has(mint)) continue;
-    const net = total - (opposite.get(mint) || 0);
-    if (net > total * 0.5) return { mint, tokens: net };
+    if (Math.abs(delta) > Math.abs(bestDelta)) { bestDelta = delta; bestMint = mint; }
   }
-  return null;
-}
+  if (!bestMint || bestDelta === 0) return null;
 
-export function extractSwap(tx: HeliusTx, solPrice: number, wallet?: string): ExtractedSwap | null {
-  // Only trust Helius's own structured swap parsing (events.swap). It reliably
-  // distinguishes real DEX swaps from everything else. We used to fall back to a
-  // heuristic ("wallet sent SOL and received a token in the same tx") when this
-  // was missing, but that produced false positives: e.g. receiving a plain token
-  // transfer/airdrop while also paying the ~0.002 SOL rent to create the token
-  // account looked identical to "bought a token with 0.002 SOL". If Helius
-  // didn't parse it as a swap, it isn't one — skip it rather than guess.
-  const swap = tx.events?.swap;
-  if (!swap) return null;
-
-  // The per-address history endpoint returns any transaction that MENTIONS the
-  // address in any role — including other people's swaps where this wallet was
-  // merely a token recipient, intermediary account, or pool. Without this
-  // check, those foreign trades got attributed to the wallet being analyzed.
-  if (wallet) {
-    const involved =
-      tx.feePayer === wallet ||
-      swap.nativeInput?.account === wallet ||
-      swap.nativeOutput?.account === wallet ||
-      swap.tokenInputs?.some((t) => t.userAccount === wallet) ||
-      swap.tokenOutputs?.some((t) => t.userAccount === wallet);
-    if (!involved) return null;
+  // SOL down + token up = buy; SOL up + token down = sell. Only count it as
+  // a buy/sell of THIS mint if the token actually moved the matching direction
+  // (guards against unrelated token dust sitting in the same transaction).
+  if (Math.abs(solDelta) >= 0.0005) {
+    const side: "buy" | "sell" = solDelta < 0 ? "buy" : "sell";
+    if ((side === "buy" && bestDelta > 0) || (side === "sell" && bestDelta < 0)) {
+      return { mint: bestMint, usd: Math.abs(solDelta) * solPrice, side, tokens: Math.abs(bestDelta) };
+    }
   }
 
-  const nativeIn = swap.nativeInput && Number(swap.nativeInput.amount) / 1e9;
-  const nativeOut = swap.nativeOutput && Number(swap.nativeOutput.amount) / 1e9;
-
-  const inTotals = sumByMint(swap.tokenInputs);
-  const outTotals = sumByMint(swap.tokenOutputs);
-  const received = pickTradedMint(outTotals, inTotals);
-  const sent = pickTradedMint(inTotals, outTotals);
-
-  // Only count as a "buy/sell" if the other side is an actual (non-stable) token.
-  // SOL<->USDC or USDC<->USDT are currency conversions, not memecoin trades.
-  if (nativeIn && nativeIn > 0.0005 && received) {
-    return { mint: received.mint, usd: nativeIn * solPrice, side: "buy", tokens: received.tokens };
-  }
-  if (nativeOut && nativeOut > 0.0005 && sent) {
-    return { mint: sent.mint, usd: nativeOut * solPrice, side: "sell", tokens: sent.tokens };
-  }
-
-  // No native SOL leg — the SOL side may be a wrapped-SOL token account
-  // instead (no native balance movement at all). Same money, different
-  // plumbing; skipping these dropped real trades just like the USDC gap did.
-  const wsolNet = (inTotals.get(WSOL) || 0) - (outTotals.get(WSOL) || 0);
-  if (wsolNet > 0.0005 && received) {
-    return { mint: received.mint, usd: wsolNet * solPrice, side: "buy", tokens: received.tokens };
-  }
-  if (wsolNet < -0.0005 && sent) {
-    return { mint: sent.mint, usd: -wsolNet * solPrice, side: "sell", tokens: sent.tokens };
-  }
-
-  // No SOL leg in any form — many trades (especially larger ones) route
+  // No SOL-side movement — many trades (especially larger ones) route
   // through USDC/USDT instead of SOL entirely. Missing these was a real bug:
   // it silently dropped a chunk of a wallet's real buy volume, making its
   // PnL% look far larger than it actually was (small counted cost, full
   // proceeds) and could even flip an actual loss into an apparent win.
-  const stableIn = (inTotals.get(USDC) || 0) + (inTotals.get(USDT) || 0);
-  const stableOut = (outTotals.get(USDC) || 0) + (outTotals.get(USDT) || 0);
-  const stableNet = stableIn - stableOut;
-  if (stableNet > 0.5 && received) {
-    return { mint: received.mint, usd: stableNet, side: "buy", tokens: received.tokens };
-  }
-  if (stableNet < -0.5 && sent) {
-    return { mint: sent.mint, usd: -stableNet, side: "sell", tokens: sent.tokens };
+  if (Math.abs(stableDelta) >= 0.5) {
+    const side: "buy" | "sell" = stableDelta < 0 ? "buy" : "sell";
+    if ((side === "buy" && bestDelta > 0) || (side === "sell" && bestDelta < 0)) {
+      return { mint: bestMint, usd: Math.abs(stableDelta), side, tokens: Math.abs(bestDelta) };
+    }
   }
 
   return null;
@@ -455,7 +435,7 @@ export function extractSwapFromRaw(
   return null;
 }
 
-export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet?: string) {
+export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet: string) {
   const positions = new Map<string, RawPosition>();
 
   for (const tx of txns) {
