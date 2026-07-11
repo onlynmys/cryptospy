@@ -25,11 +25,11 @@ import {
   runFullScan,
   makeFilterFn,
   getSolPrice,
-  extractSwap,
+  extractSwapFromRaw,
   type ScanFilters,
   type SmartWallet,
   type WalletCacheEntry,
-  type HeliusTx,
+  type RawHeliusTx,
 } from "../lib/scannerCore";
 
 const PORT = Number(process.env.DISCOVERY_PORT || 4001);
@@ -139,6 +139,7 @@ pruneSwapLog();
 const walletCache = new Map<string, WalletCacheEntry>();
 
 let scanning = false;
+let loggedSample = false;
 let lastScanTs = 0;
 let lastScanInfo: Record<string, unknown> | null = null;
 
@@ -219,15 +220,19 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
 
+      if (process.env.LOG_RAW_WEBHOOK === "1" && !loggedSample) {
+        loggedSample = true;
+        writeFileSync(join(DATA_DIR, "raw-webhook-sample.json"), body);
+        console.log("logged raw webhook sample to data/raw-webhook-sample.json");
+      }
+
       try {
-        const txs = JSON.parse(body) as HeliusTx[];
+        const txs = JSON.parse(body) as RawHeliusTx[];
         let added = 0;
         for (const tx of Array.isArray(txs) ? txs : []) {
-          const maker = tx.feePayer;
-          if (!maker || maker.length < 32) continue;
-          const swap = extractSwap(tx, solPriceCache);
+          const swap = extractSwapFromRaw(tx, solPriceCache);
           if (!swap || swap.usd < 20) continue;
-          swapLog.push({ ts: tx.timestamp, wallet: maker, usd: Math.round(swap.usd), side: swap.side });
+          swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });
           added++;
         }
         if (added) console.log(`webhook: +${added} swaps (log size ${swapLog.length})`);

@@ -244,6 +244,78 @@ export function extractSwap(tx: HeliusTx, solPrice: number): { mint: string; usd
   return null;
 }
 
+// ---------- raw webhook parsing (no Helius "enhanced" parsing = far fewer credits) ----------
+
+export interface RawHeliusTx {
+  blockTime: number;
+  meta: {
+    err: unknown | null;
+    fee: number;
+    preBalances: number[];
+    postBalances: number[];
+    preTokenBalances?: { accountIndex: number; mint: string; owner?: string; uiTokenAmount: { uiAmount: number | null } }[];
+    postTokenBalances?: { accountIndex: number; mint: string; owner?: string; uiTokenAmount: { uiAmount: number | null } }[];
+  };
+  transaction: {
+    message: { accountKeys: string[] };
+    signatures: string[];
+  };
+}
+
+// Derives a swap directly from the transaction's own before/after balances —
+// no per-DEX instruction decoding needed, and no "enhanced" parsing from
+// Helius (which is what actually costs credits per webhook delivery). Safe
+// from the earlier false-positive bug (airdrops/ATA-rent looking like tiny
+// buys) because Helius's webhook `transactionTypes: ["SWAP"]` filter has
+// already confirmed, at the classification level, that this transaction is a
+// genuine swap on one of our watched DEX programs — we're only computing the
+// USD amount here, not deciding whether it's a swap in the first place.
+export function extractSwapFromRaw(
+  tx: RawHeliusTx,
+  solPrice: number
+): { mint: string; usd: number; side: "buy" | "sell"; wallet: string; ts: number } | null {
+  if (tx.meta?.err) return null; // failed transaction, nothing actually happened
+
+  const wallet = tx.transaction?.message?.accountKeys?.[0]; // fee payer is always index 0
+  if (!wallet || wallet.length < 32) return null;
+
+  const pre = tx.meta.preBalances?.[0];
+  const post = tx.meta.postBalances?.[0];
+  if (pre === undefined || post === undefined) return null;
+
+  // Fee payer always pays the network fee out of their own balance — add it
+  // back so we isolate the SOL that actually moved as part of the swap itself.
+  const solDelta = (post - pre + (tx.meta.fee || 0)) / 1e9;
+  if (Math.abs(solDelta) < 0.0005) return null;
+
+  const preTok = new Map<string, number>();
+  for (const t of tx.meta.preTokenBalances || []) {
+    if (t.owner !== wallet || STABLES.has(t.mint)) continue;
+    preTok.set(t.mint, t.uiTokenAmount.uiAmount ?? 0);
+  }
+  const postTok = new Map<string, number>();
+  for (const t of tx.meta.postTokenBalances || []) {
+    if (t.owner !== wallet || STABLES.has(t.mint)) continue;
+    postTok.set(t.mint, t.uiTokenAmount.uiAmount ?? 0);
+  }
+
+  let bestMint: string | null = null;
+  let bestDelta = 0;
+  for (const mint of new Set([...preTok.keys(), ...postTok.keys()])) {
+    const delta = (postTok.get(mint) ?? 0) - (preTok.get(mint) ?? 0);
+    if (Math.abs(delta) > Math.abs(bestDelta)) { bestDelta = delta; bestMint = mint; }
+  }
+  if (!bestMint || bestDelta === 0) return null;
+
+  // SOL down + token up = buy; SOL up + token down = sell. Anything else
+  // (both moved the same direction) isn't a clean swap — bail rather than guess.
+  const side: "buy" | "sell" = solDelta < 0 ? "buy" : "sell";
+  if (side === "buy" && bestDelta <= 0) return null;
+  if (side === "sell" && bestDelta >= 0) return null;
+
+  return { mint: bestMint, usd: Math.abs(solDelta) * solPrice, side, wallet, ts: tx.blockTime };
+}
+
 function analyzeWallet(txns: HeliusTx[], solPrice: number) {
   const positions = new Map<string, RawPosition>();
 
