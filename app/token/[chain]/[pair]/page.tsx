@@ -475,11 +475,11 @@ export default function TokenPage({ params }: PageProps) {
         {/* Wallet detail modal */}
         {selectedWallet && (
           <div
-            className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-start justify-center p-4 overflow-y-auto"
             onClick={() => setSelectedWallet(null)}
           >
             <div
-              className="bg-[#0d1117] border border-slate-700 rounded-2xl p-6 max-w-md w-full"
+              className="bg-[#0d1117] border border-slate-700 rounded-2xl p-6 max-w-md w-full mt-8"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="flex items-center justify-between mb-5">

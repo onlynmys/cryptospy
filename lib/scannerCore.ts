@@ -208,41 +208,38 @@ interface RawPosition {
   sells: { usd: number; ts: number }[];
 }
 
-function extractSwap(tx: HeliusTx, wallet: string, solPrice: number): { mint: string; usd: number; side: "buy" | "sell" } | null {
+function extractSwap(tx: HeliusTx, solPrice: number): { mint: string; usd: number; side: "buy" | "sell" } | null {
+  // Only trust Helius's own structured swap parsing (events.swap). It reliably
+  // distinguishes real DEX swaps from everything else. We used to fall back to a
+  // heuristic ("wallet sent SOL and received a token in the same tx") when this
+  // was missing, but that produced false positives: e.g. receiving a plain token
+  // transfer/airdrop while also paying the ~0.002 SOL rent to create the token
+  // account looked identical to "bought a token with 0.002 SOL". If Helius
+  // didn't parse it as a swap, it isn't one — skip it rather than guess.
   const swap = tx.events?.swap;
+  if (!swap) return null;
 
-  if (swap) {
-    const nativeIn = swap.nativeInput && Number(swap.nativeInput.amount) / 1e9;
-    const nativeOut = swap.nativeOutput && Number(swap.nativeOutput.amount) / 1e9;
+  const nativeIn = swap.nativeInput && Number(swap.nativeInput.amount) / 1e9;
+  const nativeOut = swap.nativeOutput && Number(swap.nativeOutput.amount) / 1e9;
 
-    // Only count as a "buy/sell" if the other side is an actual (non-stable) token.
-    // SOL<->USDC or USDC<->USDT are currency conversions, not memecoin trades.
-    if (nativeIn && nativeIn > 0.0005 && swap.tokenOutputs?.length) {
-      const out = swap.tokenOutputs.find((t) => !STABLES.has(t.mint));
-      if (out) return { mint: out.mint, usd: nativeIn * solPrice, side: "buy" };
-    }
-    if (nativeOut && nativeOut > 0.0005 && swap.tokenInputs?.length) {
-      const inp = swap.tokenInputs.find((t) => !STABLES.has(t.mint));
-      if (inp) return { mint: inp.mint, usd: nativeOut * solPrice, side: "sell" };
-    }
-    return null;
+  // Only count as a "buy/sell" if the other side is an actual (non-stable) token.
+  // SOL<->USDC or USDC<->USDT are currency conversions, not memecoin trades.
+  if (nativeIn && nativeIn > 0.0005 && swap.tokenOutputs?.length) {
+    const out = swap.tokenOutputs.find((t) => !STABLES.has(t.mint));
+    if (out) return { mint: out.mint, usd: nativeIn * solPrice, side: "buy" };
   }
-
-  const solSent = (tx.nativeTransfers || []).filter((t) => t.fromUserAccount === wallet).reduce((s, t) => s + t.amount, 0) / 1e9;
-  const solRecv = (tx.nativeTransfers || []).filter((t) => t.toUserAccount === wallet).reduce((s, t) => s + t.amount, 0) / 1e9;
-  const tokRecv = (tx.tokenTransfers || []).find((t) => t.toUserAccount === wallet && !STABLES.has(t.mint));
-  const tokSent = (tx.tokenTransfers || []).find((t) => t.fromUserAccount === wallet && !STABLES.has(t.mint));
-
-  if (solSent > 0.002 && tokRecv) return { mint: tokRecv.mint, usd: solSent * solPrice, side: "buy" };
-  if (solRecv > 0.002 && tokSent) return { mint: tokSent.mint, usd: solRecv * solPrice, side: "sell" };
+  if (nativeOut && nativeOut > 0.0005 && swap.tokenInputs?.length) {
+    const inp = swap.tokenInputs.find((t) => !STABLES.has(t.mint));
+    if (inp) return { mint: inp.mint, usd: nativeOut * solPrice, side: "sell" };
+  }
   return null;
 }
 
-function analyzeWallet(txns: HeliusTx[], wallet: string, solPrice: number) {
+function analyzeWallet(txns: HeliusTx[], solPrice: number) {
   const positions = new Map<string, RawPosition>();
 
   for (const tx of txns) {
-    const swap = extractSwap(tx, wallet, solPrice);
+    const swap = extractSwap(tx, solPrice);
     if (!swap || swap.usd < 1) continue;
     if (!positions.has(swap.mint)) positions.set(swap.mint, { buys: [], sells: [] });
     const pos = positions.get(swap.mint)!;
@@ -394,7 +391,7 @@ export async function runFullScan(
       if (!maker || maker.length < 32) continue;
       if (tx.timestamp < windowAgo) continue;
 
-      const swap = extractSwap(tx, maker, solPrice);
+      const swap = extractSwap(tx, solPrice);
       if (!swap || swap.usd < 20) continue;
 
       const cur = walletActivity.get(maker) || { count: 0, totalUsd: 0 };
@@ -441,7 +438,7 @@ export async function runFullScan(
     const txns = walletTxLists[i] || [];
     if (txns.length < 2) { rejectedCount++; return; }
 
-    const stats = analyzeWallet(txns, addr, solPrice);
+    const stats = analyzeWallet(txns, solPrice);
     const totalTrades = stats.wins + stats.losses;
     if (totalTrades < 1) { rejectedCount++; return; }
 

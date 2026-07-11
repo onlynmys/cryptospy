@@ -377,13 +377,13 @@ export default function WalletsPage() {
 
       {/* Wallet Detail Modal */}
       {detail && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-start justify-center p-4 overflow-y-auto"
           onClick={() => setDetail(null)}>
-          <div className="bg-[#0d1117] border border-slate-700 rounded-2xl w-full max-w-lg max-h-[85vh] flex flex-col"
+          <div className="bg-[#0d1117] border border-slate-700 rounded-2xl w-full max-w-lg max-h-[85vh] mt-8 flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}>
 
             {/* Header */}
-            <div className="flex items-center justify-between p-5 border-b border-slate-800">
+            <div className="flex items-center justify-between p-5 border-b border-slate-800 shrink-0">
               <div>
                 <div className="text-white font-bold text-lg">Детали кошелька</div>
                 <div className="flex items-center gap-2 mt-1">
@@ -400,7 +400,7 @@ export default function WalletsPage() {
             </div>
 
             {/* Stats */}
-            <div className="grid grid-cols-3 gap-3 p-5 border-b border-slate-800">
+            <div className="grid grid-cols-3 gap-3 p-5 border-b border-slate-800 shrink-0">
               {[
                 { label: "Win Rate", value: detail.wallet.winRate.toFixed(1) + "%", color: detail.wallet.winRate >= 75 ? "text-emerald-400" : "text-yellow-400" },
                 { label: "PnL", value: fmt(detail.wallet.totalPnlUsd), color: detail.wallet.totalPnlUsd >= 0 ? "text-emerald-400" : "text-red-400" },
@@ -413,20 +413,20 @@ export default function WalletsPage() {
               ))}
             </div>
 
-            <div className="grid grid-cols-2 gap-3 px-5 pb-4 pt-3 border-b border-slate-800">
+            <div className="grid grid-cols-2 gap-3 px-5 pb-4 pt-3 border-b border-slate-800 shrink-0">
               <div className="text-sm"><span className="text-slate-500">Ср. покупка: </span><span className="text-slate-200">${detail.wallet.avgBuyUsd.toLocaleString()}</span></div>
               <div className="text-sm"><span className="text-slate-500">Активность: </span><span className="text-slate-200">{timeAgo(detail.wallet.lastActivity)}</span></div>
             </div>
 
             {/* Tags */}
-            <div className="flex gap-2 flex-wrap px-5 py-3 border-b border-slate-800">
+            <div className="flex gap-2 flex-wrap px-5 py-3 border-b border-slate-800 shrink-0">
               {detail.wallet.tags.map((t) => (
                 <span key={t} className="text-xs bg-slate-800 text-slate-300 px-2 py-1 rounded-lg">{t}</span>
               ))}
             </div>
 
             {/* Trade history */}
-            <div className="flex-1 overflow-y-auto">
+            <div className="flex-1 min-h-0 overflow-y-auto">
               <div className="px-5 py-3 text-sm font-medium text-slate-400 border-b border-slate-800">
                 История сделок
               </div>
@@ -474,7 +474,7 @@ export default function WalletsPage() {
             </div>
 
             {/* Footer */}
-            <div className="p-4 border-t border-slate-800">
+            <div className="p-4 border-t border-slate-800 shrink-0">
               <a
                 href={`https://solscan.io/account/${detail.wallet.address}`}
                 target="_blank"

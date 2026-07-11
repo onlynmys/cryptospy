@@ -77,7 +77,7 @@ export default function DiscoveriesBell() {
 
       {open && (
         <div
-          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-start sm:items-center justify-center p-4"
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-start justify-center p-4 overflow-y-auto"
           onClick={closeModal}
         >
           {copied && (
@@ -86,10 +86,10 @@ export default function DiscoveriesBell() {
             </div>
           )}
           <div
-            className="bg-[#0d1117] border border-slate-700 rounded-2xl w-full max-w-2xl max-h-[85vh] flex flex-col"
+            className="bg-[#0d1117] border border-slate-700 rounded-2xl w-full max-w-2xl max-h-[85vh] mt-8 flex flex-col overflow-hidden"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between p-5 border-b border-slate-800">
+            <div className="flex items-center justify-between p-5 border-b border-slate-800 shrink-0">
               <div>
                 <h3 className="text-lg font-bold text-white flex items-center gap-2">
                   🔔 Автонаходки Smart Money
@@ -101,7 +101,7 @@ export default function DiscoveriesBell() {
               <button onClick={closeModal} className="text-slate-500 hover:text-white text-xl w-8 h-8 flex items-center justify-center shrink-0">✕</button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-4">
+            <div className="flex-1 min-h-0 overflow-y-auto p-4">
               {loading ? (
                 <div className="text-center py-16 text-slate-500">Загрузка...</div>
               ) : unavailable ? (
@@ -130,7 +130,7 @@ export default function DiscoveriesBell() {
               )}
             </div>
 
-            <div className="px-5 py-3 border-t border-slate-800 text-xs text-slate-600 text-center">
+            <div className="px-5 py-3 border-t border-slate-800 text-xs text-slate-600 text-center shrink-0">
               Находки хранятся минимум 3 дня · Настроить пороги можно в Settings
             </div>
           </div>

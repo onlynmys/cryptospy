@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getSolPrice } from "@/lib/scannerCore";
 
 const HELIUS_BASE = "https://api.helius.xyz/v0";
 const DEX_BASE = "https://api.dexscreener.com";
@@ -8,18 +9,14 @@ interface HeliusTx {
   timestamp: number;
   feePayer: string;
   type: string;
-  tokenTransfers?: {
-    mint: string;
-    fromUserAccount: string;
-    toUserAccount: string;
-    tokenAmount: number;
-  }[];
-  nativeTransfers?: {
-    fromUserAccount: string;
-    toUserAccount: string;
-    amount: number;
-  }[];
-  accountData?: { account: string }[];
+  events?: {
+    swap?: {
+      nativeInput?: { amount: string | number };
+      nativeOutput?: { amount: string | number };
+      tokenInputs?: { mint: string }[];
+      tokenOutputs?: { mint: string }[];
+    };
+  };
 }
 
 interface TraderStats {
@@ -53,47 +50,57 @@ function getTags(winRate: number, pnl: number, avgBuy: number, trades: number): 
   return tags;
 }
 
+// Only trust Helius's structured swap event — matching plain token/native transfers
+// (airdrops, direct transfers, ATA rent payments that happen to sit in the same tx)
+// as "trades" produces false positives. If Helius didn't parse it as a swap, skip it.
+function extractTokenSwap(
+  tx: HeliusTx,
+  tokenAddress: string,
+  solPrice: number
+): { usd: number; side: "buy" | "sell" } | null {
+  const swap = tx.events?.swap;
+  if (!swap) return null;
+
+  const nativeIn = swap.nativeInput && Number(swap.nativeInput.amount) / 1e9;
+  const nativeOut = swap.nativeOutput && Number(swap.nativeOutput.amount) / 1e9;
+
+  if (nativeIn && nativeIn > 0.0005 && swap.tokenOutputs?.some((t) => t.mint === tokenAddress)) {
+    return { usd: nativeIn * solPrice, side: "buy" };
+  }
+  if (nativeOut && nativeOut > 0.0005 && swap.tokenInputs?.some((t) => t.mint === tokenAddress)) {
+    return { usd: nativeOut * solPrice, side: "sell" };
+  }
+  return null;
+}
+
 async function getRealTradersFromHelius(
   pairAddress: string,
   tokenAddress: string,
-  priceUsd: number,
   apiKey: string
 ): Promise<TraderStats[]> {
-  // Fetch recent swap transactions for this pair
-  const url = `${HELIUS_BASE}/addresses/${pairAddress}/transactions?api-key=${apiKey}&type=SWAP&limit=100`;
-  const r = await fetch(url);
+  const [r, solPrice] = await Promise.all([
+    fetch(`${HELIUS_BASE}/addresses/${pairAddress}/transactions?api-key=${apiKey}&type=SWAP&limit=100`),
+    getSolPrice(),
+  ]);
   if (!r.ok) return [];
 
   const txns: HeliusTx[] = await r.json();
   if (!Array.isArray(txns) || txns.length === 0) return [];
 
-  // Group by trader (feePayer)
   const traderMap = new Map<string, { buys: { usd: number; ts: number }[]; sells: { usd: number; ts: number }[] }>();
 
   for (const tx of txns) {
     const maker = tx.feePayer;
     if (!maker) continue;
 
-    if (!traderMap.has(maker)) {
-      traderMap.set(maker, { buys: [], sells: [] });
-    }
+    const swap = extractTokenSwap(tx, tokenAddress, solPrice);
+    if (!swap || swap.usd < 1) continue;
+
+    if (!traderMap.has(maker)) traderMap.set(maker, { buys: [], sells: [] });
     const trader = traderMap.get(maker)!;
 
-    // Determine buy or sell based on token transfers
-    const transfers = tx.tokenTransfers || [];
-    const tokenIn = transfers.find((t) => t.mint === tokenAddress && t.toUserAccount === maker);
-    const tokenOut = transfers.find((t) => t.mint === tokenAddress && t.fromUserAccount === maker);
-
-    // Estimate USD value from native SOL transfers (1 SOL ≈ $170 approximate, but use relative)
-    const solTransfers = tx.nativeTransfers || [];
-    const solAmount = solTransfers.reduce((s, t) => s + (t.fromUserAccount === maker ? t.amount : 0), 0) / 1e9;
-    const usdEst = solAmount * 170; // rough SOL price estimate
-
-    if (tokenIn) {
-      trader.buys.push({ usd: usdEst || tokenIn.tokenAmount * priceUsd, ts: tx.timestamp });
-    } else if (tokenOut) {
-      trader.sells.push({ usd: usdEst || tokenOut.tokenAmount * priceUsd, ts: tx.timestamp });
-    }
+    if (swap.side === "buy") trader.buys.push({ usd: swap.usd, ts: tx.timestamp });
+    else trader.sells.push({ usd: swap.usd, ts: tx.timestamp });
   }
 
   const results: TraderStats[] = [];
@@ -150,7 +157,6 @@ export async function GET(req: NextRequest) {
 
   // Get pair data from DEX Screener first
   let tokenAddress = "";
-  let priceUsd = 0;
 
   try {
     const r = await fetch(`${DEX_BASE}/latest/dex/pairs/${chain}/${pairAddress}`, {
@@ -159,16 +165,15 @@ export async function GET(req: NextRequest) {
     if (r.ok) {
       const d = await r.json();
       tokenAddress = d.pair?.baseToken?.address || "";
-      priceUsd = parseFloat(d.pair?.priceUsd || "0");
     }
   } catch {
     // ignore
   }
 
   // Real data via Helius (Solana only)
-  if (apiKey && chain === "solana" && pairAddress) {
+  if (apiKey && chain === "solana" && pairAddress && tokenAddress) {
     try {
-      const traders = await getRealTradersFromHelius(pairAddress, tokenAddress, priceUsd, apiKey);
+      const traders = await getRealTradersFromHelius(pairAddress, tokenAddress, apiKey);
       if (traders.length > 0) {
         return NextResponse.json({ wallets: traders, real: true, hasApiKey: true });
       }
