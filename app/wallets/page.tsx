@@ -76,6 +76,24 @@ function makeFakeWallet(addr: string): Wallet {
 type ToastType = "success" | "error" | "info";
 interface Toast { id: number; msg: string; type: ToastType }
 
+// Read-modify-write helpers — always read the CURRENT localStorage value
+// before writing, instead of deriving the new value from in-memory React
+// state (which can drift out of sync with disk across renders/tabs and
+// silently overwrite/lose previously saved entries).
+function loadCustomWallets(): Wallet[] {
+  try {
+    const raw = localStorage.getItem("custom_wallets");
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
+function loadRemovedDefaults(): string[] {
+  try {
+    const raw = localStorage.getItem("removed_default_wallets");
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+
 export default function WalletsPage() {
   const [wallets, setWallets] = useState<Wallet[]>(INITIAL_WALLETS);
   const [input, setInput] = useState("");
@@ -92,14 +110,15 @@ export default function WalletsPage() {
     try {
       const saved = localStorage.getItem("tracked_wallets");
       if (saved) setTracked(JSON.parse(saved));
-      const savedW = localStorage.getItem("custom_wallets");
-      if (savedW) {
-        const extra = JSON.parse(savedW) as Wallet[];
-        setWallets((prev) => {
-          const existing = new Set(prev.map((w) => w.address));
-          return [...prev, ...extra.filter((w) => !existing.has(w.address))];
-        });
-      }
+
+      const removedDefaults = new Set(loadRemovedDefaults());
+      const custom = loadCustomWallets();
+      const customAddrs = new Set(custom.map((w) => w.address));
+
+      setWallets([
+        ...INITIAL_WALLETS.filter((w) => !removedDefaults.has(w.address) && !customAddrs.has(w.address)),
+        ...custom,
+      ]);
     } catch {}
   }, []);
 
@@ -122,8 +141,19 @@ export default function WalletsPage() {
   function removeWallet(addr: string, e: React.MouseEvent) {
     e.stopPropagation();
     setWallets((prev) => prev.filter((w) => w.address !== addr));
-    const remaining = wallets.filter((w) => w.address !== addr && !INITIAL_WALLETS.find((d) => d.address === w.address));
-    localStorage.setItem("custom_wallets", JSON.stringify(remaining));
+
+    // Persist removal of a custom (user-added) wallet, if that's what this was
+    const remainingCustom = loadCustomWallets().filter((w) => w.address !== addr);
+    localStorage.setItem("custom_wallets", JSON.stringify(remainingCustom));
+
+    // Also remember if this was one of the hardcoded defaults, so it doesn't
+    // silently reappear on next page load
+    if (INITIAL_WALLETS.find((d) => d.address === addr)) {
+      const removed = new Set(loadRemovedDefaults());
+      removed.add(addr);
+      localStorage.setItem("removed_default_wallets", JSON.stringify(Array.from(removed)));
+    }
+
     if (detail?.wallet.address === addr) setDetail(null);
     addToast("Кошелёк удалён", "info");
   }
@@ -183,8 +213,7 @@ export default function WalletsPage() {
       setHighlightAddr(addr);
       setTimeout(() => setHighlightAddr(null), 3000);
       setInput("");
-      const custom = [newW, ...wallets.filter((w) => !INITIAL_WALLETS.find((d) => d.address === w.address))];
-      localStorage.setItem("custom_wallets", JSON.stringify(custom));
+      localStorage.setItem("custom_wallets", JSON.stringify([newW, ...loadCustomWallets()]));
       addToast(`✓ Добавлен: ${addr.slice(0, 8)}...`);
     } catch {
       const newW = makeFakeWallet(addr);
@@ -193,6 +222,7 @@ export default function WalletsPage() {
       setHighlightAddr(addr);
       setTimeout(() => setHighlightAddr(null), 3000);
       setInput("");
+      localStorage.setItem("custom_wallets", JSON.stringify([newW, ...loadCustomWallets()]));
       addToast(`✓ Добавлен: ${addr.slice(0, 8)}...`);
     } finally {
       setLoading(false);
