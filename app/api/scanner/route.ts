@@ -86,11 +86,44 @@ export async function GET(req: NextRequest) {
     });
   }
 
+  const discoveryBase = process.env.DISCOVERY_SERVER_URL;
+  if (!discoveryBase) {
+    return respondWithFallback(
+      "Сервис сбора кандидатов не настроен (DISCOVERY_SERVER_URL). Обратись к администратору.",
+      filters
+    );
+  }
+
   try {
-    const { allAnalyzed: results, scanInfo } = await runFullScan(apiKey, filters.maxInactiveHours, walletCache);
+    // Candidates come from our VM's continuously-collected (webhook-fed) swap
+    // log, not from an on-demand network pull — pulling history for busy DEX
+    // programs on demand only ever covers a few seconds, not hours. See
+    // scripts/discovery-server.ts for why.
+    let candidates: string[] = [];
+    try {
+      const cr = await fetch(`${discoveryBase}/candidates?hours=${filters.maxInactiveHours}`, {
+        signal: AbortSignal.timeout(8000),
+        cache: "no-store",
+      });
+      if (cr.ok) {
+        const cd = await cr.json();
+        candidates = cd.candidates || [];
+      }
+    } catch {
+      // handled by empty candidates fallback below
+    }
+
+    if (!candidates.length) {
+      return respondWithFallback(
+        "Сервис сбора кандидатов пока не накопил данных за это окно — подожди немного или расширь окно активности.",
+        filters
+      );
+    }
+
+    const { allAnalyzed: results, scanInfo } = await runFullScan(apiKey, candidates, walletCache);
 
     if (!results.length && !lastGoodScan) {
-      return respondWithFallback("Не найдено активных трейдеров в потоке свопов — попробуй через минуту", filters);
+      return respondWithFallback("Ни один из найденных кандидатов не набрал закрытых сделок — попробуй позже", filters);
     }
 
     // Merge newly analyzed wallets with everything kept from previous scans
@@ -112,7 +145,7 @@ export async function GET(req: NextRequest) {
     lastGoodScan = {
       wallets: allAnalyzed,
       ts: Date.now(),
-      scannedSwaps: scanInfo.scannedSwaps,
+      scannedSwaps: candidates.length,
       scannedWallets: scanInfo.scannedWallets,
     };
 
@@ -120,7 +153,7 @@ export async function GET(req: NextRequest) {
     const finalList = allAnalyzed.filter(passesFilter);
 
     const responseInfo = {
-      scannedSwaps: scanInfo.scannedSwaps,
+      scannedSwaps: candidates.length,
       scannedWallets: scanInfo.scannedWallets,
       passedFilter: finalList.length,
       analyzedTotal: allAnalyzed.length,
@@ -135,7 +168,7 @@ export async function GET(req: NextRequest) {
         real: true,
         hasApiKey: true,
         ...responseInfo,
-        message: `Проверено ${scanInfo.scannedWallets} трейдеров из ${scanInfo.scannedSwaps} свежих свопов — ни один не прошёл текущий фильтр. Попробуй ослабить фильтры или сканируй в разное время.`,
+        message: `Проверено ${scanInfo.scannedWallets} трейдеров из ${candidates.length} кандидатов — ни один не прошёл текущий фильтр. Попробуй ослабить фильтры или сканируй в разное время.`,
       });
     }
 

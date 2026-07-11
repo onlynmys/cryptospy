@@ -39,6 +39,7 @@ yarn-error.log*
 # discovery-server (runs only on this VM, not deployed)
 ecosystem.config.cjs
 /data/discoveries.json
+/data/swap-log.json
 
 # typescript
 *.tsbuildinfo

@@ -259,7 +259,7 @@ export default function ScannerPage() {
           <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-3 mb-4">
             <div className="text-xs text-slate-500 font-medium uppercase tracking-wide mb-2">Отчёт сканирования</div>
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-sm">
-              <div><span className="text-slate-500">Свопов проверено: </span><span className="text-white font-semibold">{meta.scannedSwaps}</span></div>
+              <div><span className="text-slate-500">Кандидатов из лога: </span><span className="text-white font-semibold">{meta.scannedSwaps}</span></div>
               <div><span className="text-slate-500">Трейдеров проверено: </span><span className="text-white font-semibold">{meta.scannedWallets}</span></div>
               <div><span className="text-slate-500">Прошли фильтр: </span><span className="text-emerald-400 font-semibold">{meta.passedFilter}</span></div>
               <div><span className="text-slate-500">Запросов Helius: </span><span className="text-yellow-400 font-semibold">{meta.heliusRequests}</span></div>

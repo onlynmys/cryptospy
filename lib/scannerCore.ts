@@ -80,7 +80,7 @@ export interface RecentBuy {
   status: "holding" | "sold_profit" | "sold_loss";
 }
 
-interface HeliusTx {
+export interface HeliusTx {
   signature: string;
   timestamp: number;
   feePayer: string;
@@ -122,7 +122,17 @@ async function heliusFetch(url: string, retries = 2): Promise<HeliusTx[]> {
 // Walk backwards through an address's transaction history page by page (via the
 // `before` signature cursor) until we reach `cutoffTs`, run out of pages, hit
 // `maxPages`, or blow through the shared time budget.
-async function fetchSwapsWindow(
+//
+// NOTE: for very busy programs (Jupiter, Raydium, PumpSwap) a single page of
+// 100 "SWAP" transactions can cover as little as a few seconds of real time —
+// Helius doesn't always fill a page to the requested `limit` even when much
+// more history exists, so treating a short page as "end of history" was wrong
+// and made this stop after page 1 almost every time. We only stop early on a
+// genuinely empty page now. In practice this means fully covering hours of
+// activity on hot programs via pagination alone is still not realistic (would
+// take thousands of pages) — see scripts/discovery-server.ts's webhook-fed
+// log for how we actually get multi-hour coverage on those.
+export async function fetchSwapsWindow(
   address: string,
   apiKey: string,
   cutoffTs: number,
@@ -145,7 +155,6 @@ async function fetchSwapsWindow(
     all.push(...batch);
     const oldest = batch[batch.length - 1];
     if (oldest.timestamp < cutoffTs) break;
-    if (batch.length < 100) break;
     before = oldest.signature;
     await sleep(150);
   }
@@ -208,7 +217,7 @@ interface RawPosition {
   sells: { usd: number; ts: number }[];
 }
 
-function extractSwap(tx: HeliusTx, solPrice: number): { mint: string; usd: number; side: "buy" | "sell" } | null {
+export function extractSwap(tx: HeliusTx, solPrice: number): { mint: string; usd: number; side: "buy" | "sell" } | null {
   // Only trust Helius's own structured swap parsing (events.swap). It reliably
   // distinguishes real DEX swaps from everything else. We used to fall back to a
   // heuristic ("wallet sent SOL and received a token in the same tx") when this
@@ -359,58 +368,28 @@ export interface ScanInfo {
 
 export interface WalletCacheEntry { data: SmartWallet; ts: number }
 
-// Runs the full pipeline: paginate the global swap feed within `windowHours`,
-// derive trader candidates, analyze each one's own trade history, and return
-// EVERY wallet with at least one closed trade (unfiltered — callers decide
-// what "worthy" means via makeFilterFn on the result).
+// Analyzes a pre-vetted list of candidate wallet addresses (their OWN trade
+// history is always complete regardless of volume, since it's scoped to one
+// wallet — unlike the global swap feed, which for busy DEX programs like
+// Jupiter moves too fast to paginate back more than a few seconds via
+// on-demand history pulls). Candidate discovery itself now happens via a
+// continuously-collected webhook log (see scripts/discovery-server.ts),
+// which is the only way to genuinely cover hours of activity on those programs.
 export async function runFullScan(
   apiKey: string,
-  windowHours: number,
+  candidates: string[],
   walletCache: Map<string, WalletCacheEntry>,
-  walletTtlMs = 20 * 60 * 1000,
-  timeBudgetMs = 55_000
+  walletTtlMs = 20 * 60 * 1000
 ): Promise<{ allAnalyzed: SmartWallet[]; scanInfo: ScanInfo }> {
   const scanStart = Date.now();
   let heliusRequests = 0;
 
   const solPrice = await getSolPrice();
-  const windowAgo = Date.now() / 1000 - windowHours * 3600;
-
-  const FEED_DEADLINE = scanStart + Math.min(35_000, timeBudgetMs * 0.6);
-  const sourceTxLists = await pool(DEX_SOURCES, 5, (src) =>
-    fetchSwapsWindow(src.address, apiKey, windowAgo, 10, FEED_DEADLINE, () => { heliusRequests++; })
-  );
-
-  const walletActivity = new Map<string, { count: number; totalUsd: number }>();
-  let totalSwaps = 0;
-
-  for (const txList of sourceTxLists) {
-    for (const tx of txList || []) {
-      totalSwaps++;
-      const maker = tx.feePayer;
-      if (!maker || maker.length < 32) continue;
-      if (tx.timestamp < windowAgo) continue;
-
-      const swap = extractSwap(tx, solPrice);
-      if (!swap || swap.usd < 20) continue;
-
-      const cur = walletActivity.get(maker) || { count: 0, totalUsd: 0 };
-      cur.count++;
-      cur.totalUsd += swap.usd;
-      walletActivity.set(maker, cur);
-    }
-  }
-
-  const candidates = Array.from(walletActivity.entries())
-    .filter(([, a]) => a.count <= 50)
-    .sort((a, b) => b[1].totalUsd - a[1].totalUsd)
-    .slice(0, 60)
-    .map(([addr]) => addr);
 
   if (!candidates.length) {
     return {
       allAnalyzed: [],
-      scanInfo: { scannedSwaps: totalSwaps, scannedWallets: 0, rejected: 0, heliusRequests, durationSec: Math.round((Date.now() - scanStart) / 1000) },
+      scanInfo: { scannedSwaps: 0, scannedWallets: 0, rejected: 0, heliusRequests, durationSec: Math.round((Date.now() - scanStart) / 1000) },
     };
   }
 
@@ -515,7 +494,7 @@ export async function runFullScan(
   return {
     allAnalyzed: results,
     scanInfo: {
-      scannedSwaps: totalSwaps,
+      scannedSwaps: 0,
       scannedWallets: candidates.length,
       rejected: rejectedCount,
       heliusRequests,

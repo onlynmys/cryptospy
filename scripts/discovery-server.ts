@@ -1,10 +1,22 @@
 // Standalone service that runs on this VM (NOT on Vercel) so its data survives
-// between invocations. An external cron (cron-job.org) hits /trigger every ~30min;
-// this process performs a full scan, keeps a running "discoveries" list of wallets
-// that meet the (separately configurable, stricter) discovery filter, and serves
-// that list to the website (hosted on Vercel) over HTTP.
+// between invocations. Two independent jobs happen here:
 //
-// Run persistently via: pm2 start "npx tsx scripts/discovery-server.ts" --name cryptospy-discovery
+// 1. Continuous swap collection: Helius pushes every SWAP transaction touching
+//    our watched DEX programs to POST /webhook/helius in real time. We keep a
+//    rolling in-memory + on-disk log of them (pruned to RETENTION_HOURS). This
+//    is the ONLY way to genuinely cover hours of activity on busy programs
+//    like Jupiter — pulling history on demand via pagination tops out at a few
+//    seconds of coverage per page for those, no matter how many pages you walk.
+//
+// 2. Discovery scanning: an external cron (cron-job.org) hits GET /trigger
+//    every ~30min. We pull candidates from the swap log (not the network),
+//    analyze each candidate's own full trade history via Helius, and keep a
+//    running "discoveries" list of wallets meeting a separately configurable,
+//    stricter filter. GET /candidates also serves the same candidate list to
+//    the Vercel-hosted manual Scanner page, so both features share one source
+//    of truth instead of Vercel trying (and failing) to re-derive it itself.
+//
+// Run persistently via: pm2 start ecosystem.config.cjs
 
 import { createServer } from "node:http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
@@ -12,18 +24,24 @@ import { join } from "node:path";
 import {
   runFullScan,
   makeFilterFn,
+  getSolPrice,
+  extractSwap,
   type ScanFilters,
   type SmartWallet,
   type WalletCacheEntry,
+  type HeliusTx,
 } from "../lib/scannerCore";
 
 const PORT = Number(process.env.DISCOVERY_PORT || 4001);
 const SECRET = process.env.DISCOVERY_SECRET || "";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const DATA_DIR = join(__dirname, "..", "data");
 const DISCOVERIES_PATH = join(DATA_DIR, "discoveries.json");
 const FILTERS_PATH = join(DATA_DIR, "discovery-filters.json");
-const RETENTION_MS = 3 * 24 * 3600 * 1000; // keep every discovery for at least 3 days
+const SWAP_LOG_PATH = join(DATA_DIR, "swap-log.json");
+const RETENTION_MS = 3 * 24 * 3600 * 1000; // discoveries: keep for at least 3 days
+const SWAP_RETENTION_HOURS = 24; // raw swap log: rolling 24h window
 
 const ALLOWED_ORIGINS = new Set([
   "https://cryptospy-pi.vercel.app",
@@ -42,6 +60,13 @@ interface DiscoveryRecord {
   firstSeen: number;
   lastSeen: number;
   wallet: SmartWallet;
+}
+
+interface SwapLogEntry {
+  ts: number; // seconds, matches Helius tx.timestamp
+  wallet: string;
+  usd: number;
+  side: "buy" | "sell";
 }
 
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
@@ -72,7 +97,45 @@ function pruneDiscoveries(records: DiscoveryRecord[]): DiscoveryRecord[] {
   return records.filter((r) => now - r.firstSeen < RETENTION_MS);
 }
 
-// In-memory wallet cache — persists across cron triggers since this process stays alive.
+// ---------- swap log (webhook-fed, in-memory + periodic disk snapshot) ----------
+
+let swapLog: SwapLogEntry[] = loadJson<SwapLogEntry[]>(SWAP_LOG_PATH, []);
+let solPriceCache = 170;
+
+function pruneSwapLog() {
+  const cutoff = Date.now() / 1000 - SWAP_RETENTION_HOURS * 3600;
+  swapLog = swapLog.filter((e) => e.ts >= cutoff);
+}
+
+function getCandidates(hours: number, minUsd = 20, limit = 80): string[] {
+  const cutoff = Date.now() / 1000 - hours * 3600;
+  const activity = new Map<string, { count: number; totalUsd: number }>();
+
+  for (const e of swapLog) {
+    if (e.ts < cutoff || e.usd < minUsd) continue;
+    const cur = activity.get(e.wallet) || { count: 0, totalUsd: 0 };
+    cur.count++;
+    cur.totalUsd += e.usd;
+    activity.set(e.wallet, cur);
+  }
+
+  return Array.from(activity.entries())
+    .filter(([, a]) => a.count <= 80) // skip hyperactive bots/market-makers
+    .sort((a, b) => b[1].totalUsd - a[1].totalUsd)
+    .slice(0, limit)
+    .map(([addr]) => addr);
+}
+
+// Refresh SOL price every 2 min instead of hitting DEX Screener on every webhook delivery
+setInterval(() => { getSolPrice().then((p) => { solPriceCache = p; }).catch(() => {}); }, 2 * 60_000);
+getSolPrice().then((p) => { solPriceCache = p; }).catch(() => {});
+
+// Prune + persist the swap log periodically
+setInterval(() => { pruneSwapLog(); saveJson(SWAP_LOG_PATH, swapLog); }, 60_000);
+pruneSwapLog();
+
+// ---------- discovery scanning ----------
+
 const walletCache = new Map<string, WalletCacheEntry>();
 
 let scanning = false;
@@ -86,7 +149,8 @@ async function runDiscoveryScan(): Promise<{ ok: boolean; newCount: number; tota
   scanning = true;
   try {
     const filters = loadFilters();
-    const { allAnalyzed, scanInfo } = await runFullScan(HELIUS_API_KEY, filters.maxInactiveHours, walletCache);
+    const candidates = getCandidates(filters.maxInactiveHours);
+    const { allAnalyzed, scanInfo } = await runFullScan(HELIUS_API_KEY, candidates, walletCache);
 
     const passes = makeFilterFn(filters);
     const qualifying = allAnalyzed.filter(passes);
@@ -113,7 +177,7 @@ async function runDiscoveryScan(): Promise<{ ok: boolean; newCount: number; tota
     saveJson(DISCOVERIES_PATH, pruned);
 
     lastScanTs = now;
-    lastScanInfo = { ...scanInfo, qualifying: qualifying.length };
+    lastScanInfo = { ...scanInfo, candidatesFromLog: candidates.length, swapLogSize: swapLog.length, qualifying: qualifying.length };
 
     return { ok: true, newCount, totalCount: pruned.length, info: lastScanInfo };
   } finally {
@@ -126,7 +190,7 @@ function withCors(origin: string | undefined, res: import("node:http").ServerRes
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
 const server = createServer(async (req, res) => {
@@ -142,6 +206,37 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
   try {
+    // Helius calls this on every SWAP transaction touching our watched programs.
+    if (url.pathname === "/webhook/helius" && req.method === "POST") {
+      if (!WEBHOOK_SECRET || req.headers.authorization !== WEBHOOK_SECRET) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+
+      try {
+        const txs = JSON.parse(body) as HeliusTx[];
+        let added = 0;
+        for (const tx of Array.isArray(txs) ? txs : []) {
+          const maker = tx.feePayer;
+          if (!maker || maker.length < 32) continue;
+          const swap = extractSwap(tx, solPriceCache);
+          if (!swap || swap.usd < 20) continue;
+          swapLog.push({ ts: tx.timestamp, wallet: maker, usd: Math.round(swap.usd), side: swap.side });
+          added++;
+        }
+        if (added) console.log(`webhook: +${added} swaps (log size ${swapLog.length})`);
+      } catch (e) {
+        console.error("webhook parse error:", e);
+      }
+      return;
+    }
+
     if (url.pathname === "/trigger" && req.method === "GET") {
       if (url.searchParams.get("secret") !== SECRET || !SECRET) {
         res.writeHead(401, { "Content-Type": "application/json" });
@@ -151,6 +246,16 @@ const server = createServer(async (req, res) => {
       const result = await runDiscoveryScan();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // Candidates derived from the live swap log — consumed by the Vercel-hosted
+    // manual Scanner page (proxied) as well as used internally above.
+    if (url.pathname === "/candidates" && req.method === "GET") {
+      const hours = Number(url.searchParams.get("hours") || "6") || 6;
+      const candidates = getCandidates(hours);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ candidates, swapLogSize: swapLog.length, hours }));
       return;
     }
 
@@ -189,8 +294,9 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === "/health" && req.method === "GET") {
+      const oldest = swapLog.length ? Math.round((Date.now() / 1000 - swapLog[0].ts) / 60) : 0;
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, lastScanTs, scanning }));
+      res.end(JSON.stringify({ ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest }));
       return;
     }
 
@@ -207,4 +313,6 @@ server.listen(PORT, () => {
   console.log(`discovery-server listening on :${PORT}`);
   console.log(`HELIUS_API_KEY set: ${!!HELIUS_API_KEY}`);
   console.log(`DISCOVERY_SECRET set: ${!!SECRET}`);
+  console.log(`WEBHOOK_SECRET set: ${!!WEBHOOK_SECRET}`);
+  console.log(`swap log loaded: ${swapLog.length} entries`);
 });
