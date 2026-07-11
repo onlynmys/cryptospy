@@ -29,7 +29,7 @@ interface TraderStats {
   sells: number;
   totalBuyUsd: number;
   totalSellUsd: number;
-  pnlUsd: number;
+  totalPnlUsd: number;
   winRate: number;
   totalTrades: number;
   avgBuyUsd: number;
@@ -126,7 +126,7 @@ async function getRealTradersFromHelius(
       sells: data.sells.length,
       totalBuyUsd: Math.round(totalBuyUsd),
       totalSellUsd: Math.round(totalSellUsd),
-      pnlUsd: Math.round(pnl),
+      totalPnlUsd: Math.round(pnl),
       winRate,
       totalTrades: trades,
       avgBuyUsd: Math.round(avgBuy),

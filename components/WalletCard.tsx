@@ -10,6 +10,10 @@ interface Wallet {
   lastActivity: number;
   score: number;
   tags: string[];
+  buys?: number;
+  sells?: number;
+  totalBuyUsd?: number;
+  totalSellUsd?: number;
 }
 
 interface Props {
@@ -85,6 +89,17 @@ export default function WalletCard({ wallet, rank, onClick }: Props) {
           <div className="text-xs text-slate-500">Trades</div>
         </div>
       </div>
+
+      {(wallet.buys !== undefined || wallet.totalBuyUsd !== undefined) && (
+        <div className="flex items-center justify-between text-xs mb-2 bg-slate-800/30 rounded-lg px-2 py-1.5">
+          <span className="text-emerald-400">
+            ▲ {wallet.buys ?? 0} покуп.{wallet.totalBuyUsd ? ` (${fmt(wallet.totalBuyUsd)}$)` : ""}
+          </span>
+          <span className="text-red-400">
+            ▼ {wallet.sells ?? 0} продаж{wallet.totalSellUsd ? ` (${fmt(wallet.totalSellUsd)}$)` : ""}
+          </span>
+        </div>
+      )}
 
       <div className="flex items-center justify-between text-xs">
         <div className="text-slate-500">

@@ -120,8 +120,9 @@ export default function TokenPage({ params }: PageProps) {
   const [walletMeta, setWalletMeta] = useState<{ real: boolean; hasApiKey: boolean; message?: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [walletLoading, setWalletLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"wallets" | "info">("wallets");
+  const [activeTab, setActiveTab] = useState<"chart" | "wallets" | "info">("chart");
   const [selectedWallet, setSelectedWallet] = useState<Wallet | null>(null);
+  const [walletSort, setWalletSort] = useState<"score" | "winRate" | "pnl" | "recent">("score");
 
   const fetchData = useCallback(async () => {
     try {
@@ -294,36 +295,71 @@ export default function TokenPage({ params }: PageProps) {
 
         {/* Tabs */}
         <div className="flex gap-1 bg-[#0d1117] border border-slate-800 rounded-xl p-1 mb-5 w-fit">
-          {(["wallets", "info"] as const).map((tab) => (
+          {(["chart", "wallets", "info"] as const).map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition-all capitalize ${
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
                 activeTab === tab
                   ? "bg-emerald-500 text-black"
                   : "text-slate-400 hover:text-white"
               }`}
             >
-              {tab === "wallets" ? "🧠 Smart Wallets" : "ℹ️ Token Info"}
+              {tab === "chart" ? "📈 График" : tab === "wallets" ? "🧠 Smart Wallets" : "ℹ️ Инфо"}
             </button>
           ))}
         </div>
 
+        {activeTab === "chart" && (
+          <div className="rounded-2xl overflow-hidden border border-slate-800 bg-[#0d1117]">
+            <iframe
+              src={`https://dexscreener.com/${chain}/${pair}?embed=1&theme=dark&trades=1&info=0`}
+              className="w-full border-0"
+              style={{ height: "660px" }}
+              title="DEX Screener chart"
+              allow="clipboard-write"
+            />
+          </div>
+        )}
+
         {activeTab === "wallets" && (
           <div>
-            <div className="flex items-center justify-between mb-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4">
               <h2 className="text-lg font-semibold text-white">
                 Трейдеры на этой паре
               </h2>
-              {walletMeta && wallets.length > 0 && (
-                <span className={`text-xs px-2 py-1 rounded font-medium ${
-                  walletMeta.real
-                    ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                    : "bg-slate-800 text-slate-500"
-                }`}>
-                  {walletMeta.real ? "✓ Реальные on-chain данные" : "Нет данных"}
-                </span>
-              )}
+              <div className="flex items-center gap-3">
+                {wallets.length > 1 && (
+                  <div className="flex items-center gap-1 text-xs text-slate-500">
+                    <span className="mr-1">Сорт:</span>
+                    {([
+                      { id: "score", label: "Score" },
+                      { id: "winRate", label: "Win %" },
+                      { id: "pnl", label: "PnL" },
+                      { id: "recent", label: "Активность" },
+                    ] as const).map((s) => (
+                      <button
+                        key={s.id}
+                        onClick={() => setWalletSort(s.id)}
+                        className={`px-2 py-1 rounded transition-colors ${
+                          walletSort === s.id ? "text-emerald-400 bg-emerald-500/10" : "hover:text-slate-300"
+                        }`}
+                      >
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {walletMeta && wallets.length > 0 && (
+                  <span className={`text-xs px-2 py-1 rounded font-medium shrink-0 ${
+                    walletMeta.real
+                      ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                      : "bg-slate-800 text-slate-500"
+                  }`}>
+                    {walletMeta.real ? "✓ On-chain" : "Нет данных"}
+                  </span>
+                )}
+              </div>
             </div>
 
             {walletLoading ? (
@@ -376,14 +412,21 @@ export default function TokenPage({ params }: PageProps) {
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                {wallets.map((w, i) => (
-                  <WalletCard
-                    key={w.address}
-                    wallet={w}
-                    rank={i}
-                    onClick={() => setSelectedWallet(w)}
-                  />
-                ))}
+                {[...wallets]
+                  .sort((a, b) => {
+                    if (walletSort === "winRate") return b.winRate - a.winRate;
+                    if (walletSort === "pnl") return b.totalPnlUsd - a.totalPnlUsd;
+                    if (walletSort === "recent") return b.lastActivity - a.lastActivity;
+                    return b.score - a.score;
+                  })
+                  .map((w, i) => (
+                    <WalletCard
+                      key={w.address}
+                      wallet={w}
+                      rank={i}
+                      onClick={() => setSelectedWallet(w)}
+                    />
+                  ))}
               </div>
             )}
           </div>
