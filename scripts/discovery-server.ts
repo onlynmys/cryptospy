@@ -1,14 +1,15 @@
 // Standalone service that runs on this VM (NOT on Vercel) so its data survives
 // between invocations. Two independent jobs happen here:
 //
-// 1. Continuous swap collection: a free Solana public-RPC WebSocket
-//    subscription (see solanaFeed.ts) streams logs for our watched DEX
-//    programs, and we pull the full transaction for each match — genuinely
-//    $0, no Helius credits involved at all. (We tried a Helius webhook here
-//    first; even in "raw" mode it burned through the free tier's credits
-//    far faster than expected, so we dropped Helius from this part entirely.)
-//    We keep a rolling in-memory + on-disk log of parsed swaps (pruned to
-//    SWAP_RETENTION_HOURS).
+// 1. Continuous swap collection: polls Alchemy's free-tier Solana RPC (see
+//    solanaFeed.ts) for new signatures on our watched DEX programs every
+//    ~12s, then fetches each new transaction — genuinely $0, no Helius
+//    credits. (Tried a Helius webhook first — even "raw" mode burned credits
+//    far faster than expected. Then tried Solana's public RPC directly —
+//    got the whole IP rate-limited/banned within ~90s even at a trickle.
+//    Alchemy's free WebSocket rejects every subscription method, but plain
+//    HTTP polling works fine, hence this design.) Keeps a rolling in-memory
+//    + on-disk log of parsed swaps (pruned to SWAP_RETENTION_HOURS).
 //
 // 2. Discovery scanning: an external cron (cron-job.org) hits GET /trigger
 //    every ~30min. We pull candidates from the swap log (free), then analyze
@@ -28,7 +29,6 @@ import {
   makeFilterFn,
   getSolPrice,
   extractSwapFromRaw,
-  FREE_FEED_SOURCES,
   type ScanFilters,
   type SmartWallet,
   type WalletCacheEntry,
@@ -38,6 +38,17 @@ import { startSolanaFeed, type FeedStats } from "./solanaFeed";
 const PORT = Number(process.env.DISCOVERY_PORT || 4001);
 const SECRET = process.env.DISCOVERY_SECRET || "";
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
+const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
+const ALCHEMY_RPC_URL = `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`;
+
+// Confirmed working via getSignaturesForAddress on Alchemy's free tier
+// (Jupiter/PumpSwap/Meteora DLMM all returned empty results — some indexing
+// limitation on their end for those specific addresses, not a rate issue).
+const POLL_FEED_SOURCES = [
+  { name: "Raydium AMM", address: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" },
+  { name: "Raydium CLMM", address: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },
+  { name: "Pump.fun", address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" },
+];
 const DATA_DIR = join(__dirname, "..", "data");
 const DISCOVERIES_PATH = join(DATA_DIR, "discoveries.json");
 const FILTERS_PATH = join(DATA_DIR, "discovery-filters.json");
@@ -137,7 +148,7 @@ setInterval(() => { pruneSwapLog(); saveJson(SWAP_LOG_PATH, swapLog); }, 60_000)
 pruneSwapLog();
 
 // Free, credit-free swap collection via public Solana RPC (replaces the Helius webhook)
-const feedStats: FeedStats = startSolanaFeed(FREE_FEED_SOURCES.map((s) => s.address), (tx) => {
+const feedStats: FeedStats = startSolanaFeed(ALCHEMY_RPC_URL, POLL_FEED_SOURCES.map((s) => s.address), (tx) => {
   const swap = extractSwapFromRaw(tx, solPriceCache);
   if (!swap || swap.usd < 20) return;
   swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });

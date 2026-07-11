@@ -1,24 +1,19 @@
-// Free replacement for the Helius webhook: subscribes directly to Solana's
-// public RPC pubsub (no API key, no credits, $0) for program logs on our
-// watched DEX programs, then fetches the full transaction for each matching
-// signature via the same public RPC's standard getTransaction method.
+// Swap collection via a dedicated RPC provider (Alchemy free tier), polling
+// instead of streaming. Their free plan's WebSocket endpoint accepts a
+// connection but rejects every pubsub subscription method (logsSubscribe,
+// accountSubscribe, etc. all return "method not found") — subscriptions are
+// evidently a paid-plan feature there. Plain HTTP RPC works fine on the free
+// tier though, so we poll getSignaturesForAddress per program on an interval
+// and fetch full transactions for whatever's new since the last poll.
 //
-// Tradeoffs vs. the paid webhook: the public endpoint is shared by everyone
-// and rate-limited, so under heavy load (Jupiter especially) we will drop
-// some transactions rather than process 100% of them — that's an accepted
-// degradation in exchange for genuinely zero cost. Partial real coverage
-// beats no coverage.
+// This trades a few seconds of latency (vs. instant push) for something that
+// actually works within a free plan's real constraints.
 
-import WebSocket from "ws";
 import type { RawHeliusTx } from "../lib/scannerCore";
 
-const WS_URL = "wss://api.mainnet-beta.solana.com";
-const HTTP_URL = "https://api.mainnet-beta.solana.com";
-
-// Conservative self-throttling — the public endpoint's real limits are
-// undocumented/variable, so we stay well under what's generally tolerated.
-const MAX_REQ_PER_SEC = 6;
-const MAX_QUEUE = 300;
+const POLL_INTERVAL_MS = 12_000;
+const SIG_LIMIT = 40; // per program per poll — if a program produces more than this in 12s, we miss the overflow
+const MAX_TX_FETCH_PER_SEC = 5;
 
 export interface FeedStats {
   connected: boolean;
@@ -26,112 +21,115 @@ export interface FeedStats {
   fetched: number;
   dropped: number;
   errors: number;
+  rateLimited: number;
   reconnects: number;
+  backoffUntil: number;
+  polls: number;
+}
+
+interface SigEntry { signature: string; err: unknown | null }
+
+async function rpcCall(rpcUrl: string, method: string, params: unknown[]): Promise<unknown> {
+  const res = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (res.status === 429) {
+    const err = new Error("rate_limited") as Error & { rateLimited: true };
+    err.rateLimited = true;
+    throw err;
+  }
+  if (!res.ok) throw new Error(`http_${res.status}`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || "rpc_error");
+  return data.result;
 }
 
 export function startSolanaFeed(
+  rpcUrl: string,
   programAddresses: string[],
   onSwap: (tx: RawHeliusTx) => void
 ): FeedStats {
-  const stats: FeedStats = { connected: false, queued: 0, fetched: 0, dropped: 0, errors: 0, reconnects: 0 };
-  const queue: string[] = [];
-  let inFlight = 0;
-  const subIdToAddress = new Map<number, string>();
+  const stats: FeedStats = {
+    connected: true, queued: 0, fetched: 0, dropped: 0, errors: 0,
+    rateLimited: 0, reconnects: 0, backoffUntil: 0, polls: 0,
+  };
 
-  async function fetchTransaction(signature: string) {
-    inFlight++;
+  const lastSignature = new Map<string, string>();
+  const txQueue: string[] = [];
+  let draining = false;
+  let consecutive429 = 0;
+
+  async function drainQueue() {
+    if (draining) return;
+    draining = true;
     try {
-      const res = await fetch(HTTP_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getTransaction",
-          params: [signature, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }],
-        }),
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!res.ok) { stats.errors++; return; }
-      const data = await res.json();
-      const tx = data?.result as RawHeliusTx | null;
-      if (tx) {
-        stats.fetched++;
-        onSwap(tx);
+      while (txQueue.length > 0) {
+        if (Date.now() < stats.backoffUntil) break;
+        const batch = txQueue.splice(0, MAX_TX_FETCH_PER_SEC);
+        await Promise.all(batch.map(async (sig) => {
+          try {
+            const tx = await rpcCall(rpcUrl, "getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
+            if (tx) { stats.fetched++; onSwap(tx as RawHeliusTx); }
+          } catch (e) {
+            if ((e as { rateLimited?: boolean }).rateLimited) {
+              consecutive429++;
+              stats.rateLimited++;
+              stats.backoffUntil = Date.now() + Math.min(consecutive429 * 10_000, 120_000);
+            } else {
+              stats.errors++;
+            }
+          }
+        }));
+        stats.queued = txQueue.length;
+        if (Date.now() >= stats.backoffUntil) consecutive429 = 0;
+        await new Promise((r) => setTimeout(r, 1000));
       }
-    } catch {
-      stats.errors++;
     } finally {
-      inFlight--;
+      draining = false;
     }
   }
 
-  // Drains the signature queue at a fixed, conservative rate.
-  setInterval(() => {
-    const budget = Math.max(0, MAX_REQ_PER_SEC - inFlight);
-    for (let i = 0; i < budget && queue.length > 0; i++) {
-      const sig = queue.shift();
-      if (sig) fetchTransaction(sig);
-    }
-    stats.queued = queue.length;
-  }, 1000 / MAX_REQ_PER_SEC);
+  async function pollProgram(address: string) {
+    try {
+      const params: [string, Record<string, unknown>] = [address, { limit: SIG_LIMIT }];
+      const until = lastSignature.get(address);
+      if (until) params[1].until = until;
 
-  function connect() {
-    const ws = new WebSocket(WS_URL);
+      const result = await rpcCall(rpcUrl, "getSignaturesForAddress", params) as SigEntry[];
+      if (!Array.isArray(result) || result.length === 0) return;
 
-    ws.on("open", () => {
-      stats.connected = true;
-      console.log(`solanaFeed: connected, subscribing to ${programAddresses.length} programs`);
-      programAddresses.forEach((addr, i) => {
-        ws.send(JSON.stringify({
-          jsonrpc: "2.0",
-          id: i + 1,
-          method: "logsSubscribe",
-          params: [{ mentions: [addr] }, { commitment: "confirmed" }],
-        }));
-      });
-    });
+      lastSignature.set(address, result[0].signature); // newest-first
+      const fresh = result.filter((e) => !e.err).map((e) => e.signature);
 
-    ws.on("message", (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-
-        // Subscription confirmation: {"id":N,"result":subId}
-        if (typeof msg.id === "number" && typeof msg.result === "number") {
-          subIdToAddress.set(msg.result, programAddresses[msg.id - 1]);
-          return;
-        }
-
-        // Log notification
-        if (msg.method === "logsNotification") {
-          const value = msg.params?.result?.value;
-          if (!value || value.err) return; // skip failed transactions up front
-          const signature = value.signature;
-          if (!signature) return;
-
-          if (queue.length >= MAX_QUEUE) {
-            stats.dropped++;
-            return; // queue full — drop rather than grow unbounded under load
-          }
-          queue.push(signature);
-        }
-      } catch {
+      for (const sig of fresh) {
+        if (txQueue.length >= 500) { stats.dropped++; continue; }
+        txQueue.push(sig);
+      }
+      stats.queued = txQueue.length;
+    } catch (e) {
+      if ((e as { rateLimited?: boolean }).rateLimited) {
+        stats.rateLimited++;
+      } else {
         stats.errors++;
       }
-    });
-
-    ws.on("close", () => {
-      stats.connected = false;
-      stats.reconnects++;
-      setTimeout(connect, 3000);
-    });
-
-    ws.on("error", () => {
-      stats.connected = false;
-      ws.close();
-    });
+    }
   }
 
-  connect();
+  async function pollCycle() {
+    stats.polls++;
+    if (Date.now() < stats.backoffUntil) return;
+    for (const addr of programAddresses) {
+      await pollProgram(addr);
+      await new Promise((r) => setTimeout(r, 300)); // stagger per-program calls within a cycle
+    }
+    drainQueue();
+  }
+
+  pollCycle();
+  setInterval(pollCycle, POLL_INTERVAL_MS);
+
   return stats;
 }
