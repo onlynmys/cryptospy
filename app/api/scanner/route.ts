@@ -57,17 +57,22 @@ async function loadSharedCache(): Promise<ScanCache | null> {
   return null;
 }
 
-function saveSharedCache(cache: ScanCache) {
+async function saveSharedCache(cache: ScanCache) {
   const base = process.env.DISCOVERY_SERVER_URL;
   const secret = process.env.DISCOVERY_SECRET;
   if (!base || !secret) return;
-  // Best-effort: a failure here only means other instances re-scan sooner.
-  fetch(`${base}/scan-cache?secret=${encodeURIComponent(secret)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(cache),
-    signal: AbortSignal.timeout(5000),
-  }).catch(() => {});
+  // Must be awaited before the response goes out: Vercel freezes the function
+  // as soon as it responds, killing any fire-and-forget request mid-flight —
+  // which is exactly how this cache silently stayed empty at first. A failure
+  // here only means other instances re-scan sooner.
+  try {
+    await fetch(`${base}/scan-cache?secret=${encodeURIComponent(secret)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cache),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch { /* VM unreachable */ }
 }
 
 export async function GET(req: NextRequest) {
@@ -188,7 +193,7 @@ export async function GET(req: NextRequest) {
       scannedSwaps: candidates.length,
       scannedWallets: scanInfo.scannedWallets,
     };
-    saveSharedCache(lastGoodScan);
+    await saveSharedCache(lastGoodScan);
 
     const passesFilter = makeFilterFn(filters);
     const finalList = allAnalyzed.filter(passesFilter);
