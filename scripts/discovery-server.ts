@@ -107,6 +107,10 @@ const FILTERS_PATH = join(DATA_DIR, "discovery-filters.json");
 const SWAP_LOG_PATH = join(DATA_DIR, "swap-log.json");
 const WATCHED_WALLETS_PATH = join(DATA_DIR, "watched-wallets.json");
 const WALLET_ACTIVITY_PATH = join(DATA_DIR, "wallet-activity.json");
+const FEED_STATE_PATH = join(DATA_DIR, "feed-state.json");
+const WALLET_FEED_STATE_PATH = join(DATA_DIR, "wallet-feed-state.json");
+const HELIUS_BUDGET_PATH = join(DATA_DIR, "helius-budget.json");
+const SCAN_CACHE_PATH = join(DATA_DIR, "scan-cache.json");
 const RETENTION_MS = 3 * 24 * 3600 * 1000; // discoveries: keep for at least 3 days
 const SWAP_RETENTION_HOURS = 24; // raw swap log: rolling 24h window
 const WALLET_ACTIVITY_RETENTION_HOURS = 72; // per-wallet trade notifications: rolling 3 day window
@@ -211,7 +215,8 @@ const feedStats: FeedStats = startSolanaFeed(
     const swap = extractSwapFromRaw(tx, solPriceCache);
     if (!swap || swap.usd < 20) return;
     swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });
-  }
+  },
+  FEED_STATE_PATH
 );
 
 // ---------- watched wallets (user-starred, from the Wallets page) ----------
@@ -273,7 +278,8 @@ const walletFeedStats: FeedStats = startSolanaFeed(
       mint: swap.mint,
       entry: { wallet: swap.wallet, side: swap.side, usd: Math.round(swap.usd), ts: swap.ts, detectedAt: Date.now() },
     });
-  }
+  },
+  WALLET_FEED_STATE_PATH
 );
 
 // ---------- discovery scanning ----------
@@ -292,8 +298,17 @@ let lastScanInfo: Record<string, unknown> | null = null;
 // triggers/day at ~30 candidates each (~1440 requests/day worst case).
 const DAILY_HELIUS_BUDGET = 2000;
 const DISCOVERY_CANDIDATE_LIMIT = 30;
-let heliusRequestsToday = 0;
-let budgetResetAt = Date.now() + 24 * 3600 * 1000;
+
+// Persisted across restarts — an in-memory-only counter meant a crash loop
+// (or just redeploys) reset the budget to zero each time, quietly defeating
+// the cap this exists to enforce.
+const savedBudget = loadJson<{ used: number; resetAt: number }>(HELIUS_BUDGET_PATH, { used: 0, resetAt: Date.now() + 24 * 3600 * 1000 });
+let heliusRequestsToday = savedBudget.used;
+let budgetResetAt = savedBudget.resetAt;
+
+function saveBudget() {
+  saveJson(HELIUS_BUDGET_PATH, { used: heliusRequestsToday, resetAt: budgetResetAt });
+}
 
 async function runDiscoveryScan(): Promise<{ ok: boolean; newCount: number; totalCount: number; info: unknown }> {
   if (scanning) return { ok: false, newCount: 0, totalCount: 0, info: { error: "already scanning" } };
@@ -302,6 +317,7 @@ async function runDiscoveryScan(): Promise<{ ok: boolean; newCount: number; tota
   if (Date.now() > budgetResetAt) {
     heliusRequestsToday = 0;
     budgetResetAt = Date.now() + 24 * 3600 * 1000;
+    saveBudget();
   }
   if (heliusRequestsToday >= DAILY_HELIUS_BUDGET) {
     return {
@@ -316,6 +332,7 @@ async function runDiscoveryScan(): Promise<{ ok: boolean; newCount: number; tota
     const candidates = getCandidates(filters.maxInactiveHours, 20, DISCOVERY_CANDIDATE_LIMIT);
     const { allAnalyzed, scanInfo } = await runFullScan(HELIUS_API_KEY, candidates, walletCache);
     heliusRequestsToday += scanInfo.heliusRequests;
+    saveBudget();
 
     const passes = makeFilterFn(filters);
     const qualifying = allAnalyzed.filter(passes);
@@ -427,9 +444,28 @@ const server = createServer(async (req, res) => {
       }
       let body = "";
       for await (const chunk of req) body += chunk;
-      const next = JSON.parse(body) as Partial<ScanFilters>;
+      let next: Partial<ScanFilters>;
+      try {
+        next = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "bad json" }));
+        return;
+      }
       const current = loadFilters();
-      const merged: ScanFilters = { ...current, ...next };
+      // Coerce + clamp every field — a non-numeric value here used to be
+      // saved as-is, and NaN comparisons silently reject EVERY wallet, which
+      // looks exactly like "scanner stopped finding anything".
+      const clamp = (v: unknown, fallback: number, min: number, max: number) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+      };
+      const merged: ScanFilters = {
+        minWinRate: clamp(next.minWinRate, current.minWinRate, 0, 100),
+        minPnlUsd: clamp(next.minPnlUsd, current.minPnlUsd, 0, 10_000_000),
+        maxInactiveHours: clamp(next.maxInactiveHours, current.maxInactiveHours, 1, 72),
+        minTrades: clamp(next.minTrades, current.minTrades, 1, 100),
+      };
       saveJson(FILTERS_PATH, merged);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(merged));
@@ -461,7 +497,9 @@ const server = createServer(async (req, res) => {
         return;
       }
       const { address, action } = parsed;
-      if (!address || address.length < 20) {
+      // Strict base58 Solana pubkey shape — garbage entries would waste one
+      // of the 40 watch slots AND an RPC poll slot every cycle, forever.
+      if (!address || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "invalid address" }));
         return;
@@ -476,6 +514,46 @@ const server = createServer(async (req, res) => {
       saveJson(WATCHED_WALLETS_PATH, watchedWallets);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ wallets: watchedWallets, limit: MAX_WATCHED_WALLETS }));
+      return;
+    }
+
+    // Shared cache for the manual Scanner. Vercel's serverless instances each
+    // have their own module-level memory, so "cached" results randomly came
+    // back empty depending on which instance answered — this VM is the one
+    // place all instances can agree on.
+    if (url.pathname === "/scan-cache" && req.method === "GET") {
+      const cache = loadJson<Record<string, unknown> | null>(SCAN_CACHE_PATH, null);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ cache }));
+      return;
+    }
+
+    if (url.pathname === "/scan-cache" && req.method === "POST") {
+      if (url.searchParams.get("secret") !== SECRET || !SECRET) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      let body = "";
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 3_000_000) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "too large" }));
+          return;
+        }
+      }
+      try {
+        const cache = JSON.parse(body) as { wallets?: unknown[]; ts?: number };
+        if (!Array.isArray(cache.wallets) || typeof cache.ts !== "number") throw new Error("bad shape");
+        cache.wallets = cache.wallets.slice(0, 150);
+        saveJson(SCAN_CACHE_PATH, cache);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "bad json" }));
+      }
       return;
     }
 

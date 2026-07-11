@@ -9,12 +9,14 @@
 // This trades a few seconds of latency (vs. instant push) for something that
 // actually works within a free plan's real constraints.
 
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import type { RawHeliusTx } from "../lib/scannerCore";
 
 const POLL_INTERVAL_MS = 15_000;
 const SIG_LIMIT = 40; // per address per poll — if it produces more than this in one interval, we miss the overflow
 const MAX_TX_FETCH_PER_SEC = 5;
 const ADDRESS_STAGGER_MS = 800; // spacing between getSignaturesForAddress calls within one poll cycle
+const MAX_SIG_RETRIES = 2;
 
 export interface FeedStats {
   connected: boolean;
@@ -26,6 +28,7 @@ export interface FeedStats {
   reconnects: number;
   backoffUntil: number;
   polls: number;
+  overlapsSkipped: number;
 }
 
 interface SigEntry { signature: string; err: unknown | null }
@@ -51,16 +54,39 @@ async function rpcCall(rpcUrl: string, method: string, params: unknown[]): Promi
 export function startSolanaFeed(
   rpcUrl: string,
   getAddresses: () => string[],
-  onSwap: (tx: RawHeliusTx) => void
+  onSwap: (tx: RawHeliusTx) => void,
+  // Where to persist the per-address "last seen signature" cursors. Without
+  // this, every restart re-fetched the latest SIG_LIMIT transactions per
+  // address and re-emitted swaps the consumer had already recorded —
+  // double-counting recent activity in anything persisted downstream.
+  statePath?: string
 ): FeedStats {
   const stats: FeedStats = {
     connected: true, queued: 0, fetched: 0, dropped: 0, errors: 0,
-    rateLimited: 0, reconnects: 0, backoffUntil: 0, polls: 0,
+    rateLimited: 0, reconnects: 0, backoffUntil: 0, polls: 0, overlapsSkipped: 0,
   };
 
   const lastSignature = new Map<string, string>();
+  if (statePath && existsSync(statePath)) {
+    try {
+      const saved = JSON.parse(readFileSync(statePath, "utf-8")) as Record<string, string>;
+      for (const [addr, sig] of Object.entries(saved)) lastSignature.set(addr, sig);
+    } catch { /* corrupt state file — start fresh */ }
+  }
+  let cursorsDirty = false;
+
+  function saveCursors() {
+    if (!statePath || !cursorsDirty) return;
+    try {
+      writeFileSync(statePath, JSON.stringify(Object.fromEntries(lastSignature)));
+      cursorsDirty = false;
+    } catch { /* disk hiccup — retry next cycle */ }
+  }
+
   const txQueue: string[] = [];
+  const sigRetries = new Map<string, number>();
   let draining = false;
+  let polling = false;
   let consecutive429 = 0;
 
   async function drainQueue() {
@@ -74,13 +100,25 @@ export function startSolanaFeed(
           try {
             const tx = await rpcCall(rpcUrl, "getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
             if (tx) { stats.fetched++; onSwap(tx as RawHeliusTx); }
+            sigRetries.delete(sig);
           } catch (e) {
+            // A failed fetch used to lose the signature forever; requeue a
+            // couple of times so transient errors don't drop real swaps.
+            const attempts = (sigRetries.get(sig) || 0) + 1;
             if ((e as { rateLimited?: boolean }).rateLimited) {
               consecutive429++;
               stats.rateLimited++;
               stats.backoffUntil = Date.now() + Math.min(consecutive429 * 10_000, 120_000);
+              txQueue.push(sig); // 429 isn't the signature's fault — always retry after backoff
             } else {
               stats.errors++;
+              if (attempts <= MAX_SIG_RETRIES) {
+                sigRetries.set(sig, attempts);
+                txQueue.push(sig);
+              } else {
+                sigRetries.delete(sig);
+                stats.dropped++;
+              }
             }
           }
         }));
@@ -103,6 +141,7 @@ export function startSolanaFeed(
       if (!Array.isArray(result) || result.length === 0) return;
 
       lastSignature.set(address, result[0].signature); // newest-first
+      cursorsDirty = true;
       const fresh = result.filter((e) => !e.err).map((e) => e.signature);
 
       for (const sig of fresh) {
@@ -120,14 +159,25 @@ export function startSolanaFeed(
   }
 
   async function pollCycle() {
-    stats.polls++;
-    if (Date.now() < stats.backoffUntil) return;
-    const addresses = getAddresses();
-    for (const addr of addresses) {
-      await pollProgram(addr);
-      await new Promise((r) => setTimeout(r, ADDRESS_STAGGER_MS));
+    // setInterval keeps firing on schedule regardless of how long a cycle
+    // takes; with enough watched addresses one cycle (~0.8s each) outlives
+    // the 15s interval, and overlapping cycles would compound the request
+    // rate into self-inflicted rate limiting. Skip the tick instead.
+    if (polling) { stats.overlapsSkipped++; return; }
+    polling = true;
+    try {
+      stats.polls++;
+      if (Date.now() < stats.backoffUntil) return;
+      const addresses = getAddresses();
+      for (const addr of addresses) {
+        await pollProgram(addr);
+        await new Promise((r) => setTimeout(r, ADDRESS_STAGGER_MS));
+      }
+      saveCursors();
+      drainQueue();
+    } finally {
+      polling = false;
     }
-    drainQueue();
   }
 
   pollCycle();

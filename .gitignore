@@ -43,6 +43,10 @@ ecosystem.config.cjs
 /data/raw-webhook-sample.json
 /data/watched-wallets.json
 /data/wallet-activity.json
+/data/feed-state.json
+/data/wallet-feed-state.json
+/data/helius-budget.json
+/data/scan-cache.json
 
 # typescript
 *.tsbuildinfo

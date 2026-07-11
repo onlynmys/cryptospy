@@ -1,23 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSolPrice } from "@/lib/scannerCore";
+import { getSolPrice, extractSwap, type HeliusTx } from "@/lib/scannerCore";
 
 const HELIUS_BASE = "https://api.helius.xyz/v0";
 const DEX_BASE = "https://api.dexscreener.com";
-
-interface HeliusTx {
-  signature: string;
-  timestamp: number;
-  feePayer: string;
-  type: string;
-  events?: {
-    swap?: {
-      nativeInput?: { amount: string | number };
-      nativeOutput?: { amount: string | number };
-      tokenInputs?: { mint: string }[];
-      tokenOutputs?: { mint: string }[];
-    };
-  };
-}
 
 interface TraderStats {
   address: string;
@@ -50,27 +35,17 @@ function getTags(winRate: number, pnl: number, avgBuy: number, trades: number): 
   return tags;
 }
 
-// Only trust Helius's structured swap event — matching plain token/native transfers
-// (airdrops, direct transfers, ATA rent payments that happen to sit in the same tx)
-// as "trades" produces false positives. If Helius didn't parse it as a swap, skip it.
+// Reuse the scanner's shared parser (events.swap only, SOL + wSOL + USDC/USDT
+// legs) instead of a local SOL-only copy that silently dropped wSOL- and
+// stablecoin-denominated trades, then keep only swaps of THIS token.
 function extractTokenSwap(
   tx: HeliusTx,
   tokenAddress: string,
   solPrice: number
 ): { usd: number; side: "buy" | "sell" } | null {
-  const swap = tx.events?.swap;
-  if (!swap) return null;
-
-  const nativeIn = swap.nativeInput && Number(swap.nativeInput.amount) / 1e9;
-  const nativeOut = swap.nativeOutput && Number(swap.nativeOutput.amount) / 1e9;
-
-  if (nativeIn && nativeIn > 0.0005 && swap.tokenOutputs?.some((t) => t.mint === tokenAddress)) {
-    return { usd: nativeIn * solPrice, side: "buy" };
-  }
-  if (nativeOut && nativeOut > 0.0005 && swap.tokenInputs?.some((t) => t.mint === tokenAddress)) {
-    return { usd: nativeOut * solPrice, side: "sell" };
-  }
-  return null;
+  const swap = extractSwap(tx, solPrice);
+  if (!swap || swap.mint !== tokenAddress) return null;
+  return { usd: swap.usd, side: swap.side };
 }
 
 async function getRealTradersFromHelius(

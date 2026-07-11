@@ -29,13 +29,12 @@ interface WalletDetail {
   loading: boolean;
 }
 
-const INITIAL_WALLETS: Wallet[] = [
-  { address: "9nn6KBHBGMGrTHPiwvqgbJUGMfaQdnaqCYCmQpTwjBBZ", winRate: 87.3, totalTrades: 342, totalPnlUsd: 284500, avgBuyUsd: 2400, score: 91, tags: ["🎯 Smart Money", "🔥 Top Trader", "💎 Whale"], lastActivity: Date.now() / 1000 - 3600 },
-  { address: "GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ", winRate: 81.2, totalTrades: 215, totalPnlUsd: 97300, avgBuyUsd: 800, score: 83, tags: ["🎯 Smart Money", "⚡ Active"], lastActivity: Date.now() / 1000 - 7200 },
-  { address: "5tzFkiKscXHK5ZXCGbCy9NUTna4HVMGfkJbBFMBBfTb7", winRate: 76.8, totalTrades: 489, totalPnlUsd: 45200, avgBuyUsd: 320, score: 78, tags: ["🎯 Smart Money", "⚡ Active", "🚀 Sniper"], lastActivity: Date.now() / 1000 - 1800 },
-  { address: "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH", winRate: 73.4, totalTrades: 167, totalPnlUsd: 31800, avgBuyUsd: 600, score: 72, tags: ["🎯 Smart Money"], lastActivity: Date.now() / 1000 - 10800 },
-  { address: "EhYXq3ANp5nAerUpbSgd7VK2G4Y4UCC3k8YsGL9pmYF7", winRate: 64.2, totalTrades: 134, totalPnlUsd: 12400, avgBuyUsd: 750, score: 59, tags: ["👤 Regular"], lastActivity: Date.now() / 1000 - 43200 },
-];
+// The list starts empty on purpose — every wallet here is one the user added
+// themselves, with stats computed from its real on-chain history. (There used
+// to be 5 hardcoded "example" wallets with invented stats, plus a fallback
+// that FABRICATED plausible-looking numbers from the address checksum when
+// analysis failed. Both are gone: fake data presented as real is worse than
+// an honest empty state.)
 
 function timeAgo(ts: number): string {
   const sec = Math.floor(Date.now() / 1000 - ts);
@@ -53,23 +52,26 @@ function fmt(n: number): string {
   return sign + "$" + abs.toFixed(0);
 }
 
-function makeFakeWallet(addr: string): Wallet {
-  const seed = addr.split("").reduce((s, c) => s + c.charCodeAt(0), 0);
-  const winRate = 52 + (seed % 38);
-  const trades = 30 + (seed % 400);
-  const pnl = -3000 + (seed % 80000);
-  const avgBuy = 100 + (seed % 3000);
-  const score = Math.floor(winRate * 0.4 + Math.min(Math.log10(Math.max(Math.abs(pnl), 1)) * 5, 30) + Math.min(trades / 10, 20));
+interface WalletSummary {
+  winRate: number;
+  totalTrades: number;
+  totalPnlUsd: number;
+  avgBuyUsd: number;
+  lastActivity: number;
+  openPositions: number;
+}
+
+function walletFromSummary(addr: string, s: WalletSummary, isNew = false): Wallet {
   return {
     address: addr,
-    winRate,
-    totalTrades: trades,
-    totalPnlUsd: pnl,
-    avgBuyUsd: avgBuy,
-    score,
-    tags: winRate >= 80 ? ["🎯 Smart Money", "🔥 Top Trader"] : winRate >= 70 ? ["🎯 Smart Money"] : winRate >= 60 ? ["⚡ Active"] : ["👤 Regular"],
-    lastActivity: Date.now() / 1000 - (seed % 86400),
-    isNew: true,
+    winRate: s.winRate,
+    totalTrades: s.totalTrades,
+    totalPnlUsd: s.totalPnlUsd,
+    avgBuyUsd: s.avgBuyUsd,
+    score: Math.floor(s.winRate * 0.4 + Math.min(Math.log10(Math.max(s.totalPnlUsd, 0) + 1) * 7, 35) + Math.min(s.totalTrades * 0.5, 15)),
+    tags: s.winRate >= 75 ? ["🎯 Smart Money"] : s.winRate >= 60 ? ["⚡ Active"] : ["👤 Regular"],
+    lastActivity: s.lastActivity || Date.now() / 1000,
+    isNew,
   };
 }
 
@@ -87,13 +89,6 @@ function loadCustomWallets(): Wallet[] {
   } catch { return []; }
 }
 
-function loadRemovedDefaults(): string[] {
-  try {
-    const raw = localStorage.getItem("removed_default_wallets");
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
-}
-
 interface ActivityEntry {
   wallet: string;
   mint: string;
@@ -105,7 +100,7 @@ interface ActivityEntry {
 }
 
 export default function WalletsPage() {
-  const [wallets, setWallets] = useState<Wallet[]>(INITIAL_WALLETS);
+  const [wallets, setWallets] = useState<Wallet[]>([]);
   const [input, setInput] = useState("");
   const [tracked, setTracked] = useState<string[]>([]);
   const [filter, setFilter] = useState("all");
@@ -123,14 +118,7 @@ export default function WalletsPage() {
       const saved = localStorage.getItem("tracked_wallets");
       if (saved) setTracked(JSON.parse(saved));
 
-      const removedDefaults = new Set(loadRemovedDefaults());
-      const custom = loadCustomWallets();
-      const customAddrs = new Set(custom.map((w) => w.address));
-
-      setWallets([
-        ...INITIAL_WALLETS.filter((w) => !removedDefaults.has(w.address) && !customAddrs.has(w.address)),
-        ...custom,
-      ]);
+      setWallets(loadCustomWallets());
     } catch {}
   }, []);
 
@@ -178,17 +166,8 @@ export default function WalletsPage() {
     e.stopPropagation();
     setWallets((prev) => prev.filter((w) => w.address !== addr));
 
-    // Persist removal of a custom (user-added) wallet, if that's what this was
     const remainingCustom = loadCustomWallets().filter((w) => w.address !== addr);
     localStorage.setItem("custom_wallets", JSON.stringify(remainingCustom));
-
-    // Also remember if this was one of the hardcoded defaults, so it doesn't
-    // silently reappear on next page load
-    if (INITIAL_WALLETS.find((d) => d.address === addr)) {
-      const removed = new Set(loadRemovedDefaults());
-      removed.add(addr);
-      localStorage.setItem("removed_default_wallets", JSON.stringify(Array.from(removed)));
-    }
 
     if (detail?.wallet.address === addr) setDetail(null);
     addToast("Кошелёк удалён", "info");
@@ -199,7 +178,19 @@ export default function WalletsPage() {
     try {
       const r = await fetch(`/api/wallet-analysis?wallet=${wallet.address}`);
       const d = await r.json();
-      setDetail({ wallet, trades: d.trades || [], loading: false });
+
+      // Refresh the row with the just-computed real summary — this also heals
+      // entries saved back when stats could be stale or fabricated.
+      let shown = wallet;
+      if (d.summary) {
+        shown = walletFromSummary(wallet.address, d.summary, wallet.isNew);
+        setWallets((prev) => prev.map((w) => (w.address === wallet.address ? shown : w)));
+        const custom = loadCustomWallets();
+        if (custom.some((w) => w.address === wallet.address)) {
+          localStorage.setItem("custom_wallets", JSON.stringify(custom.map((w) => (w.address === wallet.address ? shown : w))));
+        }
+      }
+      setDetail({ wallet: shown, trades: d.trades || [], loading: false });
     } catch {
       setDetail({ wallet, trades: [], loading: false });
     }
@@ -221,29 +212,19 @@ export default function WalletsPage() {
       const r = await fetch(`/api/wallet-analysis?wallet=${encodeURIComponent(addr)}`);
       const d = await r.json();
 
-      let newW: Wallet;
-      if (d.trades && d.trades.length > 0) {
-        const trades: Trade[] = d.trades;
-        const buys = trades.filter((t) => t.type === "buy");
-        const sells = trades.filter((t) => t.type === "sell");
-        const totalBuy = buys.reduce((s, t) => s + (t.amountUsd || 0), 0);
-        const totalSell = sells.reduce((s, t) => s + (t.amountUsd || 0), 0);
-        const winRate = Math.round((sells.length / Math.max(trades.length, 1)) * 100);
-        newW = {
-          address: addr,
-          winRate,
-          totalTrades: trades.length,
-          totalPnlUsd: Math.round(totalSell - totalBuy),
-          avgBuyUsd: buys.length ? Math.round(totalBuy / buys.length) : 0,
-          score: Math.floor(winRate * 0.4 + Math.min(trades.length / 10, 20)),
-          tags: winRate >= 75 ? ["🎯 Smart Money"] : winRate >= 60 ? ["⚡ Active"] : ["👤 Regular"],
-          lastActivity: Date.now() / 1000,
-          isNew: true,
-        };
-      } else {
-        newW = makeFakeWallet(addr);
+      // Only add wallets we could actually analyze — no invented stats. If a
+      // wallet has zero parseable swaps, saying so honestly beats showing a
+      // plausible-looking fake.
+      if (d.noKey) {
+        addToast("Нет Helius API ключа — анализ кошельков недоступен", "error");
+        return;
+      }
+      if (!d.summary) {
+        addToast("По этому адресу не найдено DEX-сделок (или это не Solana-кошелёк)", "error");
+        return;
       }
 
+      const newW = walletFromSummary(addr, d.summary, true);
       setWallets((prev) => [newW, ...prev]);
       setFilter("all");
       setHighlightAddr(addr);
@@ -252,14 +233,7 @@ export default function WalletsPage() {
       localStorage.setItem("custom_wallets", JSON.stringify([newW, ...loadCustomWallets()]));
       addToast(`✓ Добавлен: ${addr.slice(0, 8)}...`);
     } catch {
-      const newW = makeFakeWallet(addr);
-      setWallets((prev) => [newW, ...prev]);
-      setFilter("all");
-      setHighlightAddr(addr);
-      setTimeout(() => setHighlightAddr(null), 3000);
-      setInput("");
-      localStorage.setItem("custom_wallets", JSON.stringify([newW, ...loadCustomWallets()]));
-      addToast(`✓ Добавлен: ${addr.slice(0, 8)}...`);
+      addToast("Не удалось проанализировать кошелёк — попробуй ещё раз", "error");
     } finally {
       setLoading(false);
     }
@@ -333,7 +307,7 @@ export default function WalletsPage() {
             { label: "Всего", value: wallets.length, color: "text-white" },
             { label: "Отслеживаю", value: tracked.length, color: "text-emerald-400" },
             { label: "Smart Money", value: wallets.filter((w) => w.winRate >= 75).length, color: "text-yellow-400" },
-            { label: "Ср. Win Rate", value: (wallets.reduce((s, w) => s + w.winRate, 0) / wallets.length).toFixed(1) + "%", color: "text-blue-400" },
+            { label: "Ср. Win Rate", value: wallets.length ? (wallets.reduce((s, w) => s + w.winRate, 0) / wallets.length).toFixed(1) + "%" : "—", color: "text-blue-400" },
           ].map((s) => (
             <div key={s.label} className="bg-[#0d1117] border border-slate-800 rounded-xl p-3">
               <div className={`text-xl font-bold ${s.color}`}>{s.value}</div>
@@ -411,7 +385,7 @@ export default function WalletsPage() {
           <div className="divide-y divide-slate-800">
             {filtered.length === 0 ? (
               <div className="text-center py-12 text-slate-500">
-                {filter === "tracked" ? "Нажми ☆ у кошелька чтобы отслеживать" : "Нет кошельков"}
+                {filter === "tracked" ? "Нажми ☆ у кошелька чтобы отслеживать" : "Добавь кошелёк по адресу выше — статистика считается по его реальной истории сделок"}
               </div>
             ) : filtered.map((w, i) => (
               <div key={w.address}
@@ -555,7 +529,7 @@ export default function WalletsPage() {
                         <div className="text-xs text-slate-500">{timeAgo(trade.timestamp)}</div>
                       </div>
                       <div className="text-right shrink-0">
-                        <div className="text-sm font-semibold text-slate-200">${trade.amountUsd.toLocaleString()}</div>
+                        <div className="text-sm font-semibold text-slate-200">${(trade.amountUsd ?? 0).toLocaleString()}</div>
                         {trade.priceChange !== undefined && trade.priceChange !== null && (
                           <div className={`text-xs ${trade.priceChange >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                             {trade.priceChange >= 0 ? "+" : ""}{trade.priceChange.toFixed(1)}%
