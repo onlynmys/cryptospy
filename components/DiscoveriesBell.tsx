@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import SmartWalletRow, { timeAgo } from "@/components/SmartWalletRow";
 import type { SmartWallet } from "@/lib/scannerCore";
 
@@ -20,6 +21,10 @@ export default function DiscoveriesBell() {
   const [loading, setLoading] = useState(true);
   const [unavailable, setUnavailable] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  // document.body only exists client-side — portal target must wait for mount
+  useEffect(() => setMounted(true), []);
 
   const load = useCallback(async () => {
     try {
@@ -75,9 +80,9 @@ export default function DiscoveriesBell() {
         )}
       </button>
 
-      {open && (
+      {open && mounted && createPortal(
         <div
-          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-start justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[100] flex items-start justify-center p-4 overflow-y-auto"
           onClick={closeModal}
         >
           {copied && (
@@ -134,7 +139,8 @@ export default function DiscoveriesBell() {
               Находки хранятся минимум 3 дня · Настроить пороги можно в Settings
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </>
   );
