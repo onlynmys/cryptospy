@@ -42,17 +42,64 @@ const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
 const ALCHEMY_RPC_URL = `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`;
 
 // Confirmed working via getSignaturesForAddress on Alchemy's free tier.
-// Jupiter and PumpSwap consistently return empty results (retested multiple
-// times, minutes apart) while every other program here recovered/worked —
-// looks like a deliberate exclusion of the single highest-volume addresses
-// on the free tier, not a transient indexing lag. Orca Whirlpool was empty
-// on the very first check but came back on retest, so it's included.
+// Jupiter and PumpSwap consistently return empty results at the PROGRAM
+// level (retested multiple times, minutes apart) while every other program
+// here worked — looks like a deliberate exclusion of the single
+// highest-volume addresses on the free tier. Individual PAIR/pool accounts
+// don't hit this exclusion though (confirmed: a specific PumpSwap pair and a
+// specific Meteora DLMM pair both returned real data), so PumpSwap coverage
+// comes from watching currently-trending pair addresses directly instead of
+// the whole program — see fetchTrendingPumpswapPairs() below. Jupiter has no
+// equivalent "pair" of its own (it's a router, not a pool) — its routed
+// swaps still touch Raydium/Orca pool accounts, which we already watch, so
+// a meaningful chunk of Jupiter-routed activity is captured indirectly.
 const POLL_FEED_SOURCES = [
   { name: "Raydium AMM", address: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" },
   { name: "Raydium CLMM", address: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },
   { name: "Pump.fun", address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" },
   { name: "Orca Whirlpool", address: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" },
 ];
+
+// Refreshed periodically with currently-trending PumpSwap/Meteora pair
+// addresses (via DEX Screener, which we already use elsewhere — free, no
+// key needed) so the free-tier program-level exclusion doesn't leave those
+// two venues completely uncovered.
+let dynamicPairs: string[] = [];
+
+async function refreshDynamicPairs() {
+  try {
+    const [boostsRes, profilesRes] = await Promise.all([
+      fetch("https://api.dexscreener.com/token-boosts/top/v1"),
+      fetch("https://api.dexscreener.com/token-profiles/latest/v1"),
+    ]);
+    const boosts = boostsRes.ok ? await boostsRes.json() : [];
+    const profiles = profilesRes.ok ? await profilesRes.json() : [];
+
+    const tokenAddrs = [...boosts, ...profiles]
+      .filter((t: { chainId?: string }) => t.chainId === "solana")
+      .map((t: { tokenAddress: string }) => t.tokenAddress)
+      .slice(0, 30);
+
+    if (!tokenAddrs.length) return;
+
+    const detailRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddrs.join(",")}`);
+    if (!detailRes.ok) return;
+    const detail = await detailRes.json();
+
+    const pairs = (detail.pairs || []) as { dexId: string; pairAddress: string }[];
+    dynamicPairs = pairs
+      .filter((p) => p.dexId === "pumpswap" || p.dexId === "meteora")
+      .map((p) => p.pairAddress)
+      .slice(0, 5);
+
+    console.log(`refreshDynamicPairs: watching ${dynamicPairs.length} trending PumpSwap/Meteora pairs`);
+  } catch (e) {
+    console.error("refreshDynamicPairs error:", e);
+  }
+}
+
+refreshDynamicPairs();
+setInterval(refreshDynamicPairs, 5 * 60_000);
 const DATA_DIR = join(__dirname, "..", "data");
 const DISCOVERIES_PATH = join(DATA_DIR, "discoveries.json");
 const FILTERS_PATH = join(DATA_DIR, "discovery-filters.json");
@@ -152,11 +199,15 @@ setInterval(() => { pruneSwapLog(); saveJson(SWAP_LOG_PATH, swapLog); }, 60_000)
 pruneSwapLog();
 
 // Free, credit-free swap collection via public Solana RPC (replaces the Helius webhook)
-const feedStats: FeedStats = startSolanaFeed(ALCHEMY_RPC_URL, POLL_FEED_SOURCES.map((s) => s.address), (tx) => {
-  const swap = extractSwapFromRaw(tx, solPriceCache);
-  if (!swap || swap.usd < 20) return;
-  swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });
-});
+const feedStats: FeedStats = startSolanaFeed(
+  ALCHEMY_RPC_URL,
+  () => [...POLL_FEED_SOURCES.map((s) => s.address), ...dynamicPairs],
+  (tx) => {
+    const swap = extractSwapFromRaw(tx, solPriceCache);
+    if (!swap || swap.usd < 20) return;
+    swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });
+  }
+);
 
 // ---------- discovery scanning ----------
 
@@ -298,7 +349,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname === "/health" && req.method === "GET") {
       const oldest = swapLog.length ? Math.round((Date.now() / 1000 - swapLog[0].ts) / 60) : 0;
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest, feed: feedStats }));
+      res.end(JSON.stringify({ ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest, feed: feedStats, dynamicPairsWatched: dynamicPairs.length }));
       return;
     }
 

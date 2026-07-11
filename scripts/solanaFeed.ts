@@ -11,9 +11,10 @@
 
 import type { RawHeliusTx } from "../lib/scannerCore";
 
-const POLL_INTERVAL_MS = 12_000;
-const SIG_LIMIT = 40; // per program per poll — if a program produces more than this in 12s, we miss the overflow
+const POLL_INTERVAL_MS = 15_000;
+const SIG_LIMIT = 40; // per address per poll — if it produces more than this in one interval, we miss the overflow
 const MAX_TX_FETCH_PER_SEC = 5;
+const ADDRESS_STAGGER_MS = 800; // spacing between getSignaturesForAddress calls within one poll cycle
 
 export interface FeedStats {
   connected: boolean;
@@ -49,7 +50,7 @@ async function rpcCall(rpcUrl: string, method: string, params: unknown[]): Promi
 
 export function startSolanaFeed(
   rpcUrl: string,
-  programAddresses: string[],
+  getAddresses: () => string[],
   onSwap: (tx: RawHeliusTx) => void
 ): FeedStats {
   const stats: FeedStats = {
@@ -105,7 +106,7 @@ export function startSolanaFeed(
       const fresh = result.filter((e) => !e.err).map((e) => e.signature);
 
       for (const sig of fresh) {
-        if (txQueue.length >= 500) { stats.dropped++; continue; }
+        if (txQueue.length >= 200) { stats.dropped++; continue; }
         txQueue.push(sig);
       }
       stats.queued = txQueue.length;
@@ -121,9 +122,10 @@ export function startSolanaFeed(
   async function pollCycle() {
     stats.polls++;
     if (Date.now() < stats.backoffUntil) return;
-    for (const addr of programAddresses) {
+    const addresses = getAddresses();
+    for (const addr of addresses) {
       await pollProgram(addr);
-      await new Promise((r) => setTimeout(r, 300)); // stagger per-program calls within a cycle
+      await new Promise((r) => setTimeout(r, ADDRESS_STAGGER_MS));
     }
     drainQueue();
   }
