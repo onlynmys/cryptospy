@@ -362,10 +362,17 @@ export interface RawHeliusTx {
 // already confirmed, at the classification level, that this transaction is a
 // genuine swap on one of our watched DEX programs — we're only computing the
 // USD amount here, not deciding whether it's a swap in the first place.
-export function extractSwapFromRaw(
-  tx: RawHeliusTx,
-  solPrice: number
-): { mint: string; usd: number; side: "buy" | "sell"; wallet: string; ts: number } | null {
+export interface RawExtractedSwap {
+  mint: string;
+  usd: number;
+  side: "buy" | "sell";
+  wallet: string;
+  ts: number;
+  tokens: number;
+  signature: string;
+}
+
+export function extractSwapFromRaw(tx: RawHeliusTx, solPrice: number): RawExtractedSwap | null {
   if (tx.meta?.err) return null; // failed transaction, nothing actually happened
 
   const wallet = tx.transaction?.message?.accountKeys?.[0]; // fee payer is always index 0
@@ -408,11 +415,13 @@ export function extractSwapFromRaw(
   const wsolDelta = (postTok.get(WSOL) ?? 0) - (preTok.get(WSOL) ?? 0);
   const solDelta = nativeDelta + wsolDelta;
 
+  const signature = tx.transaction?.signatures?.[0] || "";
+
   if (bestMint && bestDelta !== 0 && Math.abs(solDelta) >= 0.0005) {
     // SOL down + token up = buy; SOL up + token down = sell.
     const side: "buy" | "sell" = solDelta < 0 ? "buy" : "sell";
     if ((side === "buy" && bestDelta > 0) || (side === "sell" && bestDelta < 0)) {
-      return { mint: bestMint, usd: Math.abs(solDelta) * solPrice, side, wallet, ts: tx.blockTime };
+      return { mint: bestMint, usd: Math.abs(solDelta) * solPrice, side, wallet, ts: tx.blockTime, tokens: Math.abs(bestDelta), signature };
     }
   }
 
@@ -427,7 +436,7 @@ export function extractSwapFromRaw(
     if (Math.abs(stableDelta) >= 0.5) {
       const side: "buy" | "sell" = stableDelta < 0 ? "buy" : "sell";
       if ((side === "buy" && bestDelta > 0) || (side === "sell" && bestDelta < 0)) {
-        return { mint: bestMint, usd: Math.abs(stableDelta), side, wallet, ts: tx.blockTime };
+        return { mint: bestMint, usd: Math.abs(stableDelta), side, wallet, ts: tx.blockTime, tokens: Math.abs(bestDelta), signature };
       }
     }
   }
@@ -435,16 +444,42 @@ export function extractSwapFromRaw(
   return null;
 }
 
-export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet: string) {
-  const positions = new Map<string, RawPosition>();
+// A swap extracted from ANY source (Helius accountData or raw RPC balance
+// deltas), reduced to the fields the FIFO position matcher below actually
+// needs. Keeping this decoupled from HeliusTx/RawHeliusTx lets the same
+// matching logic serve both the Helius-backed scanner AND the Helius-free
+// full wallet history page.
+export interface TimedSwap {
+  mint: string;
+  usd: number;
+  tokens: number;
+  side: "buy" | "sell";
+  ts: number;
+}
 
+export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet: string) {
+  const swaps: TimedSwap[] = [];
   for (const tx of txns) {
     const swap = extractSwap(tx, solPrice, wallet);
-    if (!swap || swap.usd < 1) continue;
+    if (swap && swap.usd >= 1) swaps.push({ ...swap, ts: tx.timestamp });
+  }
+  return buildWalletStats(swaps);
+}
+
+export interface RealizedEvent { ts: number; mint: string; pnl: number }
+
+export function buildWalletStats(swaps: TimedSwap[]) {
+  const positions = new Map<string, RawPosition>();
+  // Chronological realized-PnL events, one per sell that matched against
+  // inventory — lets the caller plot a cumulative PnL-over-time chart
+  // spanning every position, not just a single closed-position total.
+  const realizedEvents: RealizedEvent[] = [];
+
+  for (const swap of swaps) {
     if (!positions.has(swap.mint)) positions.set(swap.mint, { buys: [], sells: [] });
     const pos = positions.get(swap.mint)!;
-    if (swap.side === "buy") pos.buys.push({ usd: swap.usd, ts: tx.timestamp, tokens: swap.tokens });
-    else pos.sells.push({ usd: swap.usd, ts: tx.timestamp, tokens: swap.tokens });
+    if (swap.side === "buy") pos.buys.push({ usd: swap.usd, ts: swap.ts, tokens: swap.tokens });
+    else pos.sells.push({ usd: swap.usd, ts: swap.ts, tokens: swap.tokens });
   }
 
   let wins = 0, losses = 0, realizedPnl = 0, totalBuyUsd = 0, totalSellUsd = 0, buyCount = 0;
@@ -502,6 +537,7 @@ export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet: string
             matchedCost += cost;
             invTok -= m;
             invCost -= cost;
+            realizedEvents.push({ ts: e.ts, mint, pnl: proceeds - cost });
           }
           // sell with zero inventory: skipped — nothing it can close
         }
@@ -513,6 +549,7 @@ export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet: string
         matchedProceeds = sellUsd;
         pnl = sellUsd - buyUsd;
         fullyClosed = true;
+        realizedEvents.push({ ts: lastTs, mint, pnl });
       }
 
       // Nothing matched at all (every sell predates every buy) — same as a
@@ -568,7 +605,7 @@ export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet: string
     }
   }
 
-  const allTs = txns.map((t) => t.timestamp);
+  const allTs = swaps.map((s) => s.ts);
 
   return {
     wins,
@@ -582,6 +619,7 @@ export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet: string
     firstActivity: allTs.length ? Math.min(...allTs) : 0,
     openPositions: positionInfos.filter((p) => p.status === "open").length,
     positionInfos,
+    realizedEvents: realizedEvents.sort((a, b) => a.ts - b.ts),
   };
 }
 

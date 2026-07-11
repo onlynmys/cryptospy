@@ -35,6 +35,7 @@ import {
   type WalletCacheEntry,
 } from "../lib/scannerCore";
 import { startSolanaFeed, type FeedStats } from "./solanaFeed";
+import { fetchWalletHistoryPage } from "./walletHistory";
 
 const PORT = Number(process.env.DISCOVERY_PORT || 4001);
 const SECRET = process.env.DISCOVERY_SECRET || "";
@@ -115,6 +116,8 @@ const RETENTION_MS = 3 * 24 * 3600 * 1000; // discoveries: keep for at least 3 d
 const SWAP_RETENTION_HOURS = 24; // raw swap log: rolling 24h window
 const WALLET_ACTIVITY_RETENTION_HOURS = 72; // per-wallet trade notifications: rolling 3 day window
 const MAX_WATCHED_WALLETS = 40; // keeps the personal-wallet poller well within Alchemy's free-tier tolerance
+
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 const ALLOWED_ORIGINS = new Set([
   "https://cryptospy-pi.vercel.app",
@@ -499,7 +502,7 @@ const server = createServer(async (req, res) => {
       const { address, action } = parsed;
       // Strict base58 Solana pubkey shape — garbage entries would waste one
       // of the 40 watch slots AND an RPC poll slot every cycle, forever.
-      if (!address || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+      if (!address || !SOLANA_ADDRESS_RE.test(address)) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "invalid address" }));
         return;
@@ -562,6 +565,31 @@ const server = createServer(async (req, res) => {
       const limit = Number(url.searchParams.get("limit") || "50") || 50;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ activity: walletActivity.slice(0, limit) }));
+      return;
+    }
+
+    // Full per-wallet trade history without Helius — one page per request,
+    // paginated via a signature cursor (?before=), fetched live from Alchemy
+    // RPC. No caching: each page is a bounded, self-contained fetch (see
+    // walletHistory.ts), cheap enough to just re-run on demand.
+    if (url.pathname === "/wallet-history" && req.method === "GET") {
+      const wallet = url.searchParams.get("wallet") || "";
+      if (!SOLANA_ADDRESS_RE.test(wallet)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid wallet address" }));
+        return;
+      }
+      const before = url.searchParams.get("before") || undefined;
+      const pageSize = Number(url.searchParams.get("limit") || "50") || 50;
+      try {
+        const page = await fetchWalletHistoryPage(ALCHEMY_RPC_URL, wallet, before, solPriceCache, pageSize);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(page));
+      } catch (e) {
+        console.error("wallet-history error:", e);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "failed to fetch wallet history" }));
+      }
       return;
     }
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import type { SmartWallet, RecentBuy, TokenPositionInfo } from "@/lib/scannerCore";
 
 export function timeAgo(ts: number): string {
@@ -249,6 +250,11 @@ export default function SmartWalletRow({ wallet, onCopy, extraBadge, defaultExpa
           )}
 
           <div className="flex gap-2 px-4 py-4 flex-wrap">
+            <Link
+              href={`/wallet/${wallet.address}`}
+              onClick={(e) => e.stopPropagation()}
+              className="text-xs px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/20 rounded-lg transition-colors font-medium"
+            >📊 Полная история</Link>
             <a
               href={`https://solscan.io/account/${wallet.address}`}
               target="_blank" rel="noopener noreferrer"

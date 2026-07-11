@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import Link from "next/link";
 import Navbar from "@/components/Navbar";
 
 interface Wallet {
@@ -543,14 +544,20 @@ export default function WalletsPage() {
             </div>
 
             {/* Footer */}
-            <div className="p-4 border-t border-slate-800 shrink-0">
+            <div className="p-4 border-t border-slate-800 shrink-0 flex gap-2">
+              <Link
+                href={`/wallet/${detail.wallet.address}`}
+                className="flex-1 text-center py-2.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded-xl text-sm hover:bg-emerald-500/20 transition-colors"
+              >
+                📊 Полная история
+              </Link>
               <a
                 href={`https://solscan.io/account/${detail.wallet.address}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="block w-full text-center py-2.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded-xl text-sm hover:bg-emerald-500/20 transition-colors"
+                className="flex-1 text-center py-2.5 bg-slate-800 border border-slate-700 text-slate-300 rounded-xl text-sm hover:border-slate-600 transition-colors"
               >
-                ↗ Открыть на Solscan
+                ↗ Solscan
               </a>
             </div>
           </div>
