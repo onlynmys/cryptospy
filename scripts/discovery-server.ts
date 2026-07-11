@@ -41,13 +41,17 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
 const ALCHEMY_RPC_URL = `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`;
 
-// Confirmed working via getSignaturesForAddress on Alchemy's free tier
-// (Jupiter/PumpSwap/Meteora DLMM all returned empty results — some indexing
-// limitation on their end for those specific addresses, not a rate issue).
+// Confirmed working via getSignaturesForAddress on Alchemy's free tier.
+// Jupiter and PumpSwap consistently return empty results (retested multiple
+// times, minutes apart) while every other program here recovered/worked —
+// looks like a deliberate exclusion of the single highest-volume addresses
+// on the free tier, not a transient indexing lag. Orca Whirlpool was empty
+// on the very first check but came back on retest, so it's included.
 const POLL_FEED_SOURCES = [
   { name: "Raydium AMM", address: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" },
   { name: "Raydium CLMM", address: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },
   { name: "Pump.fun", address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" },
+  { name: "Orca Whirlpool", address: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" },
 ];
 const DATA_DIR = join(__dirname, "..", "data");
 const DISCOVERIES_PATH = join(DATA_DIR, "discoveries.json");
