@@ -29,6 +29,7 @@ import {
   makeFilterFn,
   getSolPrice,
   extractSwapFromRaw,
+  resolveSymbols,
   type ScanFilters,
   type SmartWallet,
   type WalletCacheEntry,
@@ -104,8 +105,12 @@ const DATA_DIR = join(__dirname, "..", "data");
 const DISCOVERIES_PATH = join(DATA_DIR, "discoveries.json");
 const FILTERS_PATH = join(DATA_DIR, "discovery-filters.json");
 const SWAP_LOG_PATH = join(DATA_DIR, "swap-log.json");
+const WATCHED_WALLETS_PATH = join(DATA_DIR, "watched-wallets.json");
+const WALLET_ACTIVITY_PATH = join(DATA_DIR, "wallet-activity.json");
 const RETENTION_MS = 3 * 24 * 3600 * 1000; // discoveries: keep for at least 3 days
 const SWAP_RETENTION_HOURS = 24; // raw swap log: rolling 24h window
+const WALLET_ACTIVITY_RETENTION_HOURS = 72; // per-wallet trade notifications: rolling 3 day window
+const MAX_WATCHED_WALLETS = 40; // keeps the personal-wallet poller well within Alchemy's free-tier tolerance
 
 const ALLOWED_ORIGINS = new Set([
   "https://cryptospy-pi.vercel.app",
@@ -206,6 +211,68 @@ const feedStats: FeedStats = startSolanaFeed(
     const swap = extractSwapFromRaw(tx, solPriceCache);
     if (!swap || swap.usd < 20) return;
     swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });
+  }
+);
+
+// ---------- watched wallets (user-starred, from the Wallets page) ----------
+//
+// A regular trader's own wallet has far lower transaction volume than a
+// whole DEX program, so polling it directly via getSignaturesForAddress
+// gives genuinely COMPLETE coverage (not "whatever happens to intersect
+// with the programs we already watch") — same technique as the trending
+// pairs above, just pointed at specific addresses instead.
+
+interface WalletActivityEntry {
+  wallet: string;
+  mint: string;
+  symbol: string;
+  side: "buy" | "sell";
+  usd: number;
+  ts: number;
+  detectedAt: number;
+}
+
+let watchedWallets: string[] = loadJson<string[]>(WATCHED_WALLETS_PATH, []);
+let walletActivity: WalletActivityEntry[] = loadJson<WalletActivityEntry[]>(WALLET_ACTIVITY_PATH, []);
+
+function pruneWalletActivity() {
+  const cutoff = Date.now() / 1000 - WALLET_ACTIVITY_RETENTION_HOURS * 3600;
+  walletActivity = walletActivity.filter((e) => e.ts >= cutoff);
+}
+
+setInterval(() => { pruneWalletActivity(); saveJson(WALLET_ACTIVITY_PATH, walletActivity); }, 60_000);
+pruneWalletActivity();
+
+const pendingSymbolLookups: { mint: string; entry: Omit<WalletActivityEntry, "symbol" | "mint"> }[] = [];
+
+async function flushSymbolLookups() {
+  if (!pendingSymbolLookups.length) return;
+  const batch = pendingSymbolLookups.splice(0, pendingSymbolLookups.length);
+  try {
+    const symbols = await resolveSymbols(batch.map((b) => b.mint));
+    for (const { mint, entry } of batch) {
+      walletActivity.unshift({ ...entry, mint, symbol: symbols.get(mint) || mint.slice(0, 6) });
+    }
+    walletActivity = walletActivity.slice(0, 500);
+  } catch {
+    for (const { mint, entry } of batch) {
+      walletActivity.unshift({ ...entry, mint, symbol: mint.slice(0, 6) });
+    }
+  }
+}
+setInterval(flushSymbolLookups, 5_000);
+
+const walletFeedStats: FeedStats = startSolanaFeed(
+  ALCHEMY_RPC_URL,
+  () => watchedWallets,
+  (tx) => {
+    const swap = extractSwapFromRaw(tx, solPriceCache);
+    if (!swap || swap.usd < 1) return;
+    if (!watchedWallets.includes(swap.wallet)) return; // fee payer might differ from the watched address in edge cases
+    pendingSymbolLookups.push({
+      mint: swap.mint,
+      entry: { wallet: swap.wallet, side: swap.side, usd: Math.round(swap.usd), ts: swap.ts, detectedAt: Date.now() },
+    });
   }
 );
 
@@ -369,12 +436,64 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Wallets starred on the /wallets page — synced here so this VM's poller
+    // knows which specific addresses to watch.
+    if (url.pathname === "/watched-wallets" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ wallets: watchedWallets, limit: MAX_WATCHED_WALLETS }));
+      return;
+    }
+
+    if (url.pathname === "/watched-wallets" && req.method === "POST") {
+      if (url.searchParams.get("secret") !== SECRET || !SECRET) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      let parsed: { address?: string; action?: "add" | "remove" };
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "bad json" }));
+        return;
+      }
+      const { address, action } = parsed;
+      if (!address || address.length < 20) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid address" }));
+        return;
+      }
+      if (action === "remove") {
+        watchedWallets = watchedWallets.filter((w) => w !== address);
+      } else {
+        if (!watchedWallets.includes(address) && watchedWallets.length < MAX_WATCHED_WALLETS) {
+          watchedWallets = [...watchedWallets, address];
+        }
+      }
+      saveJson(WATCHED_WALLETS_PATH, watchedWallets);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ wallets: watchedWallets, limit: MAX_WATCHED_WALLETS }));
+      return;
+    }
+
+    // Recent detected trades on watched wallets — polled by the Wallets page for notifications.
+    if (url.pathname === "/wallet-activity" && req.method === "GET") {
+      const limit = Number(url.searchParams.get("limit") || "50") || 50;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ activity: walletActivity.slice(0, limit) }));
+      return;
+    }
+
     if (url.pathname === "/health" && req.method === "GET") {
       const oldest = swapLog.length ? Math.round((Date.now() / 1000 - swapLog[0].ts) / 60) : 0;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest,
         feed: feedStats, dynamicPairsWatched: dynamicPairs.length,
+        walletFeed: walletFeedStats, watchedWalletsCount: watchedWallets.length,
         heliusBudget: { used: heliusRequestsToday, limit: DAILY_HELIUS_BUDGET, resetsInMin: Math.round((budgetResetAt - Date.now()) / 60000) },
       }));
       return;

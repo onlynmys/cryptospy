@@ -94,6 +94,16 @@ function loadRemovedDefaults(): string[] {
   } catch { return []; }
 }
 
+interface ActivityEntry {
+  wallet: string;
+  mint: string;
+  symbol: string;
+  side: "buy" | "sell";
+  usd: number;
+  ts: number;
+  detectedAt: number;
+}
+
 export default function WalletsPage() {
   const [wallets, setWallets] = useState<Wallet[]>(INITIAL_WALLETS);
   const [input, setInput] = useState("");
@@ -104,6 +114,8 @@ export default function WalletsPage() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [highlightAddr, setHighlightAddr] = useState<string | null>(null);
   const [detail, setDetail] = useState<WalletDetail | null>(null);
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [activityUnavailable, setActivityUnavailable] = useState(false);
   const toastId = useRef(0);
 
   useEffect(() => {
@@ -122,6 +134,22 @@ export default function WalletsPage() {
     } catch {}
   }, []);
 
+  useEffect(() => {
+    async function loadActivity() {
+      try {
+        const r = await fetch("/api/wallet-activity?limit=30", { cache: "no-store" });
+        const d = await r.json();
+        setActivity(d.activity || []);
+        setActivityUnavailable(!!d.unavailable);
+      } catch {
+        setActivityUnavailable(true);
+      }
+    }
+    loadActivity();
+    const interval = setInterval(loadActivity, 30_000);
+    return () => clearInterval(interval);
+  }, []);
+
   function addToast(msg: string, type: ToastType = "success") {
     const id = ++toastId.current;
     setToasts((t) => [...t, { id, msg, type }]);
@@ -130,12 +158,20 @@ export default function WalletsPage() {
 
   function toggleTrack(addr: string, e?: React.MouseEvent) {
     e?.stopPropagation();
-    const updated = tracked.includes(addr)
-      ? tracked.filter((a) => a !== addr)
-      : [...tracked, addr];
+    const wasTracked = tracked.includes(addr);
+    const updated = wasTracked ? tracked.filter((a) => a !== addr) : [...tracked, addr];
     setTracked(updated);
     localStorage.setItem("tracked_wallets", JSON.stringify(updated));
-    addToast(tracked.includes(addr) ? "Убрано из отслеживания" : "Добавлено ⭐", "info");
+    addToast(wasTracked ? "Убрано из отслеживания" : "Добавлено ⭐ — сервер начнёт следить за новыми сделками", "info");
+
+    // Sync to the VM's poller so it actually watches this wallet on-chain,
+    // not just remembers it locally. Best-effort — a failure here just means
+    // the star still works as a personal bookmark, minus live notifications.
+    fetch("/api/watched-wallets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address: addr, action: wasTracked ? "remove" : "add" }),
+    }).catch(() => {});
   }
 
   function removeWallet(addr: string, e: React.MouseEvent) {
@@ -305,6 +341,35 @@ export default function WalletsPage() {
             </div>
           ))}
         </div>
+
+        {/* Live activity on tracked wallets */}
+        {tracked.length > 0 && (
+          <div className="bg-[#0d1117] border border-slate-700 rounded-xl p-4 mb-5">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
+              <span className="text-sm font-medium text-slate-300">Активность на отслеживаемых кошельках</span>
+            </div>
+            {activityUnavailable ? (
+              <div className="text-xs text-slate-600">Сервис отслеживания сейчас недоступен</div>
+            ) : activity.filter((a) => tracked.includes(a.wallet)).length === 0 ? (
+              <div className="text-xs text-slate-600">Пока новых сделок не обнаружено — сервер опрашивает кошельки в фоне</div>
+            ) : (
+              <div className="space-y-1.5">
+                {activity.filter((a) => tracked.includes(a.wallet)).slice(0, 8).map((a, i) => (
+                  <div key={i} className="flex items-center gap-3 text-sm">
+                    <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-xs shrink-0 ${
+                      a.side === "buy" ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"
+                    }`}>{a.side === "buy" ? "▲" : "▼"}</span>
+                    <span className="font-mono text-xs text-slate-500 shrink-0">{a.wallet.slice(0, 6)}...</span>
+                    <span className="text-slate-200 font-medium">{a.symbol}</span>
+                    <span className="text-slate-500 text-xs">${a.usd.toLocaleString()}</span>
+                    <span className="text-slate-600 text-xs ml-auto shrink-0">{timeAgo(a.ts)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Filters */}
         <div className="flex flex-col sm:flex-row gap-3 mb-4">

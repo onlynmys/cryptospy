@@ -41,6 +41,8 @@ ecosystem.config.cjs
 /data/discoveries.json
 /data/swap-log.json
 /data/raw-webhook-sample.json
+/data/watched-wallets.json
+/data/wallet-activity.json
 
 # typescript
 *.tsbuildinfo

@@ -200,7 +200,7 @@ export async function getSolPrice(): Promise<number> {
 
 const symbolCache = new Map<string, string>();
 
-async function resolveSymbols(mints: string[]): Promise<Map<string, string>> {
+export async function resolveSymbols(mints: string[]): Promise<Map<string, string>> {
   const unknown = mints.filter((m) => !symbolCache.has(m));
   for (let i = 0; i < unknown.length; i += 30) {
     try {
