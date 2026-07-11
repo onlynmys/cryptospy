@@ -3,36 +3,12 @@
 import { useState, useEffect, useCallback, useMemo, use } from "react";
 import Link from "next/link";
 import Navbar from "@/components/Navbar";
-import { buildWalletStats, type RawExtractedSwap } from "@/lib/scannerCore";
-import {
-  ResponsiveContainer,
-  AreaChart,
-  Area,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Cell,
-} from "recharts";
+import { buildWalletStats, type TimedSwap } from "@/lib/scannerCore";
+import type { WalletEvent, WalletEventType } from "@/scripts/walletHistory";
+import { PnlLineChart, VolumeBars, TokenPnlBars, fmtUsd } from "@/components/walletCharts";
 
 interface PageProps {
   params: Promise<{ address: string }>;
-}
-
-type Trade = RawExtractedSwap & { symbol: string };
-
-const GREEN = "#34d399";
-const RED = "#f87171";
-const SLATE = "#64748b";
-
-function fmt(n: number): string {
-  const sign = n < 0 ? "-" : "";
-  const abs = Math.abs(n);
-  if (abs >= 1_000_000) return sign + "$" + (abs / 1_000_000).toFixed(1) + "M";
-  if (abs >= 1_000) return sign + "$" + (abs / 1_000).toFixed(1) + "K";
-  return sign + "$" + abs.toFixed(abs < 10 ? 2 : 0);
 }
 
 function timeAgo(ts: number): string {
@@ -43,14 +19,45 @@ function timeAgo(ts: number): string {
   return Math.floor(sec / 86400) + "д назад";
 }
 
-function dayKey(ts: number): string {
-  return new Date(ts * 1000).toISOString().slice(0, 10);
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + "B";
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
+  return n >= 100 ? n.toFixed(0) : n.toFixed(2);
+}
+
+function shortAddr(a: string): string {
+  return a.slice(0, 6) + "..." + a.slice(-4);
+}
+
+const EVENT_META: Record<WalletEventType, { label: string; badge: string; cls: string }> = {
+  buy: { label: "Покупка", badge: "КУПИЛ", cls: "bg-emerald-500/15 text-emerald-400" },
+  sell: { label: "Продажа", badge: "ПРОДАЛ", cls: "bg-red-500/15 text-red-400" },
+  token_in: { label: "Получение токенов", badge: "ПОЛУЧИЛ", cls: "bg-sky-500/15 text-sky-400" },
+  token_out: { label: "Отправка токенов", badge: "ОТПРАВИЛ", cls: "bg-orange-500/15 text-orange-400" },
+  sol_in: { label: "Получение SOL", badge: "SOL ⬇", cls: "bg-cyan-500/15 text-cyan-300" },
+  sol_out: { label: "Отправка SOL", badge: "SOL ⬆", cls: "bg-amber-500/15 text-amber-300" },
+};
+
+type FilterTab = "all" | "trades" | "transfers" | "sol";
+const FILTER_TABS: { id: FilterTab; label: string }[] = [
+  { id: "all", label: "Все" },
+  { id: "trades", label: "Сделки" },
+  { id: "transfers", label: "Переводы токенов" },
+  { id: "sol", label: "Переводы SOL" },
+];
+
+function matchesTab(e: WalletEvent, tab: FilterTab): boolean {
+  if (tab === "all") return true;
+  if (tab === "trades") return e.type === "buy" || e.type === "sell";
+  if (tab === "transfers") return e.type === "token_in" || e.type === "token_out";
+  return e.type === "sol_in" || e.type === "sol_out";
 }
 
 export default function WalletHistoryPage({ params }: PageProps) {
   const { address } = use(params);
 
-  const [trades, setTrades] = useState<Trade[]>([]);
+  const [events, setEvents] = useState<WalletEvent[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
   const [rawSeen, setRawSeen] = useState(0);
@@ -58,6 +65,7 @@ export default function WalletHistoryPage({ params }: PageProps) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [tab, setTab] = useState<FilterTab>("all");
 
   const loadPage = useCallback(
     async (before: string | undefined, isFirst: boolean) => {
@@ -69,7 +77,7 @@ export default function WalletHistoryPage({ params }: PageProps) {
         const r = await fetch(`/api/wallet-history?${qs}`, { cache: "no-store" });
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || "failed");
-        setTrades((prev) => [...prev, ...(d.trades || [])]);
+        setEvents((prev) => [...prev, ...(d.events || [])]);
         setNextBefore(d.nextBefore ?? null);
         setHasMore(!!d.hasMore);
         setRawSeen((n) => n + (d.rawTxCount || 0));
@@ -86,8 +94,7 @@ export default function WalletHistoryPage({ params }: PageProps) {
     loadPage(undefined, true);
 
     // Record this visit for the search page's "недавно проверенные" list,
-    // regardless of whether the user arrived via search or a direct link
-    // from Scanner/Wallets/DiscoveriesBell.
+    // regardless of whether the user arrived via search or a direct link.
     try {
       const RECENT_KEY = "recent_wallet_checks";
       const raw = localStorage.getItem(RECENT_KEY);
@@ -98,60 +105,126 @@ export default function WalletHistoryPage({ params }: PageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [address]);
 
-  // Every aggregate below is recomputed from whatever's been loaded so far —
-  // this is a windowed view (paginated straight from Solana RPC, no Helius),
-  // not necessarily this wallet's entire lifetime history.
-  const stats = useMemo(() => buildWalletStats(trades), [trades]);
+  // ---------- derived analytics (recomputed as more pages load) ----------
+
+  const swaps = useMemo<TimedSwap[]>(
+    () =>
+      events
+        .filter((e) => (e.type === "buy" || e.type === "sell") && e.mint && e.usd !== null)
+        .map((e) => ({ mint: e.mint!, usd: e.usd!, tokens: e.tokens || 0, side: e.type as "buy" | "sell", ts: e.ts })),
+    [events]
+  );
+
+  const stats = useMemo(() => buildWalletStats(swaps), [swaps]);
 
   const symbolByMint = useMemo(() => {
     const m = new Map<string, string>();
-    for (const t of trades) m.set(t.mint, t.symbol);
+    for (const e of events) if (e.mint && e.symbol) m.set(e.mint, e.symbol);
     return m;
-  }, [trades]);
+  }, [events]);
 
-  const cumulativePnlSeries = useMemo(() => {
+  const pnlSeries = useMemo(() => {
     let running = 0;
     return stats.realizedEvents.map((e) => {
       running += e.pnl;
-      return { ts: e.ts, date: new Date(e.ts * 1000).toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }), pnl: Math.round(running) };
+      return { ts: e.ts, value: Math.round(running) };
     });
   }, [stats.realizedEvents]);
 
   const dailyVolume = useMemo(() => {
     const byDay = new Map<string, { buy: number; sell: number }>();
-    for (const t of trades) {
-      const k = dayKey(t.ts);
+    for (const s of swaps) {
+      const k = new Date(s.ts * 1000).toISOString().slice(0, 10);
       const cur = byDay.get(k) || { buy: 0, sell: 0 };
-      if (t.side === "buy") cur.buy += t.usd; else cur.sell += t.usd;
+      if (s.side === "buy") cur.buy += s.usd; else cur.sell += s.usd;
       byDay.set(k, cur);
     }
     return Array.from(byDay.entries())
       .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([day, v]) => ({ day: day.slice(5), buy: Math.round(v.buy), sell: Math.round(v.sell) }));
-  }, [trades]);
+      .map(([day, v]) => ({ day: day.slice(5).replace("-", "."), buy: Math.round(v.buy), sell: Math.round(v.sell) }));
+  }, [swaps]);
 
-  const topPositions = useMemo(() => {
-    return [...stats.positionInfos]
-      .sort((a, b) => Math.abs(b.pnlUsd) - Math.abs(a.pnlUsd))
-      .slice(0, 10)
-      .map((p) => ({ ...p, symbol: symbolByMint.get(p.mint) || p.mint.slice(0, 6), label: (symbolByMint.get(p.mint) || p.mint.slice(0, 6)).slice(0, 10) }));
-  }, [stats.positionInfos, symbolByMint]);
+  const tokenPnlRows = useMemo(
+    () =>
+      [...stats.positionInfos]
+        .filter((p) => p.sellCount > 0)
+        .sort((a, b) => Math.abs(b.pnlUsd) - Math.abs(a.pnlUsd))
+        .slice(0, 12)
+        .map((p) => ({ label: symbolByMint.get(p.mint) || p.mint.slice(0, 6), value: p.pnlUsd })),
+    [stats.positionInfos, symbolByMint]
+  );
 
-  const sortedPositions = useMemo(() => {
-    return [...stats.positionInfos].sort((a, b) => {
-      if (a.status !== b.status) return a.status === "open" ? -1 : 1;
-      return Math.abs(b.pnlUsd) - Math.abs(a.pnlUsd);
-    });
-  }, [stats.positionInfos]);
+  // Per-mint transfer totals — shown inside position rows so "sold more than
+  // bought" cases visibly trace back to tokens that arrived by transfer.
+  const transfersByMint = useMemo(() => {
+    const m = new Map<string, { inTok: number; outTok: number }>();
+    for (const e of events) {
+      if ((e.type !== "token_in" && e.type !== "token_out") || !e.mint) continue;
+      const cur = m.get(e.mint) || { inTok: 0, outTok: 0 };
+      if (e.type === "token_in") cur.inTok += e.tokens || 0; else cur.outTok += e.tokens || 0;
+      m.set(e.mint, cur);
+    }
+    return m;
+  }, [events]);
 
-  function copyAddress() {
-    navigator.clipboard?.writeText(address);
+  const counterparties = useMemo(() => {
+    const m = new Map<string, { inUsd: number; outUsd: number; count: number; lastTs: number }>();
+    for (const e of events) {
+      if (!e.counterparty) continue;
+      const cur = m.get(e.counterparty) || { inUsd: 0, outUsd: 0, count: 0, lastTs: 0 };
+      const usd = e.usd ?? 0;
+      if (e.type === "token_in" || e.type === "sol_in") cur.inUsd += usd;
+      else cur.outUsd += usd;
+      cur.count++;
+      cur.lastTs = Math.max(cur.lastTs, e.ts);
+      m.set(e.counterparty, cur);
+    }
+    return Array.from(m.entries())
+      .sort((a, b) => (b[1].inUsd + b[1].outUsd) - (a[1].inUsd + a[1].outUsd))
+      .slice(0, 8);
+  }, [events]);
+
+  const flows = useMemo(() => {
+    let solIn = 0, solOut = 0, feeSol = 0, transfersInUsd = 0, transfersOutUsd = 0;
+    for (const e of events) {
+      if (e.feeSol) feeSol += e.feeSol;
+      if (e.type === "sol_in") solIn += e.sol || 0;
+      if (e.type === "sol_out") solOut += e.sol || 0;
+      if (e.type === "token_in") transfersInUsd += e.usd ?? 0;
+      if (e.type === "token_out") transfersOutUsd += e.usd ?? 0;
+    }
+    return { solIn, solOut, feeSol, transfersInUsd, transfersOutUsd };
+  }, [events]);
+
+  const sortedPositions = useMemo(
+    () =>
+      [...stats.positionInfos].sort((a, b) => {
+        if (a.status !== b.status) return a.status === "open" ? -1 : 1;
+        return Math.abs(b.pnlUsd) - Math.abs(a.pnlUsd);
+      }),
+    [stats.positionInfos]
+  );
+
+  const filteredEvents = useMemo(() => events.filter((e) => matchesTab(e, tab)), [events, tab]);
+  const tabCounts = useMemo(() => {
+    const c: Record<FilterTab, number> = { all: events.length, trades: 0, transfers: 0, sol: 0 };
+    for (const e of events) {
+      if (e.type === "buy" || e.type === "sell") c.trades++;
+      else if (e.type === "token_in" || e.type === "token_out") c.transfers++;
+      else c.sol++;
+    }
+    return c;
+  }, [events]);
+
+  function copyAddress(a: string = address) {
+    navigator.clipboard?.writeText(a);
     setToast("Адрес скопирован");
     setTimeout(() => setToast(null), 2000);
   }
 
   const totalTrades = stats.wins + stats.losses;
   const winRate = totalTrades > 0 ? Math.round((stats.wins / totalTrades) * 100) : 0;
+  const oldestTs = events.length ? events[events.length - 1].ts : null;
 
   return (
     <div className="min-h-screen">
@@ -165,16 +238,16 @@ export default function WalletHistoryPage({ params }: PageProps) {
 
       <main className="max-w-6xl mx-auto px-4 py-6">
         {/* Header */}
-        <div className="flex items-center justify-between mb-6 gap-3 flex-wrap">
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
           <div>
-            <Link href="/wallets" className="text-sm text-slate-500 hover:text-slate-300 transition-colors">
-              ← Назад к кошелькам
+            <Link href="/wallet" className="text-sm text-slate-500 hover:text-slate-300 transition-colors">
+              ← Проверить другой кошелёк
             </Link>
             <div className="flex items-center gap-2 mt-1">
-              <h1 className="text-xl font-bold text-white font-mono">
+              <h1 className="text-xl font-bold text-white font-mono break-all">
                 {address.slice(0, 10)}...{address.slice(-8)}
               </h1>
-              <button onClick={copyAddress} className="text-slate-500 hover:text-emerald-400 transition-colors" title="Скопировать">⎘</button>
+              <button onClick={() => copyAddress()} className="text-slate-500 hover:text-emerald-400 transition-colors" title="Скопировать">⎘</button>
             </div>
           </div>
           <div className="flex gap-2">
@@ -183,13 +256,8 @@ export default function WalletHistoryPage({ params }: PageProps) {
               { label: "Birdeye", href: `https://birdeye.so/profile/${address}?chain=solana` },
               { label: "GMGN", href: `https://gmgn.ai/sol/address/${address}` },
             ].map((l) => (
-              <a
-                key={l.label}
-                href={l.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-3 py-2 bg-slate-800/50 border border-slate-700 rounded-lg text-xs text-slate-300 hover:border-emerald-500/50 hover:text-emerald-400 transition-colors"
-              >
+              <a key={l.label} href={l.href} target="_blank" rel="noopener noreferrer"
+                className="px-3 py-2 bg-slate-800/50 border border-slate-700 rounded-lg text-xs text-slate-300 hover:border-emerald-500/50 hover:text-emerald-400 transition-colors">
                 ↗ {l.label}
               </a>
             ))}
@@ -197,181 +265,214 @@ export default function WalletHistoryPage({ params }: PageProps) {
         </div>
 
         <p className="text-xs text-slate-600 mb-5">
-          Данные собраны напрямую из блокчейна (без Helius) — учтено {trades.length} сделок из {rawSeen} проверенных транзакций.
-          Это окно истории, а не обязательно весь срок жизни кошелька.
+          Прочитано напрямую из блокчейна: {events.length} событий из {rawSeen} транзакций
+          {oldestTs ? `, окно с ${new Date(oldestTs * 1000).toLocaleDateString("ru-RU")} по сейчас` : ""}.
+          Сделки в SOL оценены по курсу своего дня; переводы токенов — по текущей цене (≈).
         </p>
 
         {loading ? (
           <div className="flex items-center justify-center py-24">
             <div className="w-8 h-8 border-2 border-slate-700 border-t-emerald-400 rounded-full animate-spin" />
           </div>
-        ) : error && !trades.length ? (
+        ) : error && !events.length ? (
           <div className="text-center py-16 text-slate-500">{error}</div>
-        ) : !trades.length ? (
+        ) : !events.length ? (
           <div className="text-center py-16 text-slate-500">
-            Сделок не найдено — либо кошелёк неактивен, либо это не Solana-адрес
+            Активности не найдено — либо кошелёк пуст, либо это не Solana-адрес
           </div>
         ) : (
           <>
-            {/* Stats */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+            {/* Stats: trading */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-3">
               {[
-                { label: "Win Rate", value: totalTrades ? winRate + "%" : "—", color: winRate >= 60 ? "text-emerald-400" : "text-slate-300" },
-                { label: "PnL (загружено)", value: fmt(stats.totalPnlUsd), color: stats.totalPnlUsd >= 0 ? "text-emerald-400" : "text-red-400" },
-                { label: "Закрытых сделок", value: `${totalTrades} (${stats.wins}W/${stats.losses}L)`, color: "text-white" },
-                { label: "Открытых позиций", value: stats.openPositions, color: "text-yellow-400" },
-                { label: "Объём покупок", value: fmt(stats.totalBuyVolumeUsd), color: "text-slate-300" },
-                { label: "Объём продаж", value: fmt(stats.totalSellVolumeUsd), color: "text-slate-300" },
+                { label: "Реализ. PnL", value: fmtUsd(stats.totalPnlUsd), color: stats.totalPnlUsd >= 0 ? "text-emerald-400" : "text-red-400" },
+                { label: "Win Rate", value: totalTrades ? `${winRate}% (${stats.wins}W/${stats.losses}L)` : "—", color: winRate >= 60 && totalTrades ? "text-emerald-400" : "text-slate-300" },
+                { label: "Куплено", value: fmtUsd(stats.totalBuyVolumeUsd), color: "text-slate-200" },
+                { label: "Продано", value: fmtUsd(stats.totalSellVolumeUsd), color: "text-slate-200" },
+                { label: "Открытых позиций", value: String(stats.openPositions), color: "text-yellow-400" },
+                { label: "Ср. покупка", value: stats.avgBuyUsd ? fmtUsd(stats.avgBuyUsd) : "—", color: "text-slate-300" },
               ].map((s) => (
                 <div key={s.label} className="bg-[#0d1117] border border-slate-800 rounded-xl p-3">
-                  <div className={`text-lg font-bold ${s.color}`}>{s.value}</div>
-                  <div className="text-xs text-slate-500">{s.label}</div>
+                  <div className={`text-base font-bold ${s.color} truncate`}>{s.value}</div>
+                  <div className="text-[11px] text-slate-500 mt-0.5">{s.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Stats: flows & costs */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+              {[
+                { label: "SOL получено", value: flows.solIn ? flows.solIn.toFixed(2) + " ◎" : "—", color: "text-cyan-300" },
+                { label: "SOL отправлено", value: flows.solOut ? flows.solOut.toFixed(2) + " ◎" : "—", color: "text-amber-300" },
+                { label: "Токены получены (≈)", value: flows.transfersInUsd ? "~" + fmtUsd(flows.transfersInUsd) : "—", color: "text-sky-400" },
+                { label: "Токены отправлены (≈)", value: flows.transfersOutUsd ? "~" + fmtUsd(flows.transfersOutUsd) : "—", color: "text-orange-400" },
+                { label: "Комиссии сети", value: flows.feeSol ? flows.feeSol.toFixed(4) + " ◎" : "—", color: "text-slate-400" },
+                { label: "Ср. удержание", value: stats.avgHoldMinutes ? (stats.avgHoldMinutes < 60 ? Math.round(stats.avgHoldMinutes) + "м" : (stats.avgHoldMinutes / 60).toFixed(1) + "ч") : "—", color: "text-slate-300" },
+              ].map((s) => (
+                <div key={s.label} className="bg-[#0d1117] border border-slate-800 rounded-xl p-3">
+                  <div className={`text-base font-bold ${s.color} truncate`}>{s.value}</div>
+                  <div className="text-[11px] text-slate-500 mt-0.5">{s.label}</div>
                 </div>
               ))}
             </div>
 
             {/* Charts */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
-              <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-4">
-                <div className="text-sm font-medium text-slate-300 mb-3">📈 Накопленный реализованный PnL</div>
-                {cumulativePnlSeries.length ? (
-                  <ResponsiveContainer width="100%" height={220}>
-                    <AreaChart data={cumulativePnlSeries}>
-                      <defs>
-                        <linearGradient id="pnlGradient" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor={GREEN} stopOpacity={0.35} />
-                          <stop offset="100%" stopColor={GREEN} stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                      <XAxis dataKey="date" stroke={SLATE} fontSize={11} tickLine={false} axisLine={false} />
-                      <YAxis stroke={SLATE} fontSize={11} tickLine={false} axisLine={false} tickFormatter={(v) => fmt(v)} width={55} />
-                      <Tooltip
-                        contentStyle={{ background: "#0d1117", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
-                        labelStyle={{ color: "#94a3b8" }}
-                        formatter={(v) => [fmt(Number(v)), "PnL"]}
-                      />
-                      <Area type="monotone" dataKey="pnl" stroke={GREEN} strokeWidth={2} fill="url(#pnlGradient)" />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <div className="h-[220px] flex items-center justify-center text-sm text-slate-600">Нет закрытых сделок в загруженном окне</div>
-                )}
+              <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-4 overflow-visible">
+                <div className="text-sm font-medium text-slate-300 mb-4">📈 Накопленный реализованный PnL</div>
+                <PnlLineChart points={pnlSeries} />
               </div>
-
               <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-4">
-                <div className="text-sm font-medium text-slate-300 mb-3">📊 Объём по дням</div>
-                <ResponsiveContainer width="100%" height={220}>
-                  <BarChart data={dailyVolume}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                    <XAxis dataKey="day" stroke={SLATE} fontSize={11} tickLine={false} axisLine={false} />
-                    <YAxis stroke={SLATE} fontSize={11} tickLine={false} axisLine={false} tickFormatter={(v) => fmt(v)} width={55} />
-                    <Tooltip
-                      contentStyle={{ background: "#0d1117", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
-                      labelStyle={{ color: "#94a3b8" }}
-                      formatter={(v, name) => [fmt(Number(v)), name === "buy" ? "Покупки" : "Продажи"]}
-                    />
-                    <Bar dataKey="buy" fill={GREEN} radius={[3, 3, 0, 0]} />
-                    <Bar dataKey="sell" fill={RED} radius={[3, 3, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
+                <div className="text-sm font-medium text-slate-300 mb-4">📊 Объём сделок по дням</div>
+                <VolumeBars days={dailyVolume} />
               </div>
             </div>
 
-            {/* Per-token PnL breakdown */}
-            {topPositions.length > 0 && (
+            {tokenPnlRows.length > 0 && (
               <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-4 mb-6">
-                <div className="text-sm font-medium text-slate-300 mb-3">🪙 PnL по токенам</div>
-                <ResponsiveContainer width="100%" height={Math.max(topPositions.length * 32, 100)}>
-                  <BarChart data={topPositions} layout="vertical" margin={{ left: 10 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" horizontal={false} />
-                    <XAxis type="number" stroke={SLATE} fontSize={11} tickLine={false} axisLine={false} tickFormatter={(v) => fmt(v)} />
-                    <YAxis type="category" dataKey="label" stroke={SLATE} fontSize={11} tickLine={false} axisLine={false} width={80} />
-                    <Tooltip
-                      contentStyle={{ background: "#0d1117", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
-                      labelStyle={{ color: "#94a3b8" }}
-                      formatter={(v) => [fmt(Number(v)), "PnL"]}
-                    />
-                    <Bar dataKey="pnlUsd" radius={[0, 4, 4, 0]}>
-                      {topPositions.map((p, i) => (
-                        <Cell key={i} fill={p.pnlUsd >= 0 ? GREEN : RED} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
+                <div className="text-sm font-medium text-slate-300 mb-4">🪙 PnL по токенам</div>
+                <TokenPnlBars rows={tokenPnlRows} />
               </div>
             )}
 
-            {/* Positions */}
-            <div className="bg-[#0d1117] border border-slate-800 rounded-xl overflow-hidden mb-6">
-              <div className="px-4 py-3 text-sm font-medium text-slate-300 border-b border-slate-800">
-                Позиции ({sortedPositions.length})
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6 items-start">
+              {/* Positions */}
+              <div className="bg-[#0d1117] border border-slate-800 rounded-xl overflow-hidden">
+                <div className="px-4 py-3 text-sm font-medium text-slate-300 border-b border-slate-800">
+                  Позиции ({sortedPositions.length})
+                </div>
+                <div className="divide-y divide-slate-800/50 max-h-[420px] overflow-y-auto">
+                  {sortedPositions.length === 0 && (
+                    <div className="px-4 py-8 text-center text-sm text-slate-600">Нет позиций в загруженном окне</div>
+                  )}
+                  {sortedPositions.map((p) => {
+                    const tr = transfersByMint.get(p.mint);
+                    return (
+                      <div key={p.mint} className="px-4 py-3">
+                        <div className="flex items-center gap-3">
+                          <span className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs shrink-0 ${
+                            p.status === "open" ? "bg-yellow-500/10 text-yellow-400" : p.pnlUsd >= 0 ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"
+                          }`}>
+                            {p.status === "open" ? "◐" : p.pnlUsd >= 0 ? "✓" : "✕"}
+                          </span>
+                          <div className="flex-1 min-w-0">
+                            <div className="font-semibold text-white text-sm">{symbolByMint.get(p.mint) || p.mint.slice(0, 6)}</div>
+                            <div className="text-xs text-slate-500">
+                              {p.buyCount} покуп. {fmtUsd(p.buyUsd)}{p.sellCount ? ` → ${p.sellCount} продаж ${fmtUsd(p.sellUsd)}` : ""}
+                            </div>
+                          </div>
+                          <div className="text-right shrink-0">
+                            {p.status === "open" && p.sellCount === 0 ? (
+                              <span className="text-xs text-yellow-400">открыта</span>
+                            ) : (
+                              <>
+                                <div className={`text-sm font-bold ${p.pnlUsd >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmtUsd(p.pnlUsd)}</div>
+                                <div className={`text-[11px] ${p.pnlPct >= 0 ? "text-emerald-400/60" : "text-red-400/60"}`}>{p.pnlPct >= 0 ? "+" : ""}{p.pnlPct.toFixed(1)}%{p.status === "open" ? " · частично" : ""}</div>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                        {tr && (tr.inTok > 0 || tr.outTok > 0) && (
+                          <div className="mt-1.5 ml-10 text-[11px] text-sky-400/80">
+                            переводами: {tr.inTok > 0 && `получено ${fmtTokens(tr.inTok)}`}{tr.inTok > 0 && tr.outTok > 0 && " · "}{tr.outTok > 0 && `отправлено ${fmtTokens(tr.outTok)}`}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-              <div className="divide-y divide-slate-800/50">
-                {sortedPositions.map((p) => (
-                  <div key={p.mint} className="flex items-center gap-3 px-4 py-3">
-                    <span className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs shrink-0 ${
-                      p.status === "open" ? "bg-yellow-500/10 text-yellow-400" : p.pnlUsd >= 0 ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"
-                    }`}>
-                      {p.status === "open" ? "◐" : p.pnlUsd >= 0 ? "✓" : "✕"}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <div className="font-semibold text-white text-sm">{symbolByMint.get(p.mint) || p.mint.slice(0, 6)}</div>
-                      <div className="text-xs text-slate-500">
-                        {p.buyCount} покуп. на {fmt(p.buyUsd)}{p.sellCount ? ` → ${p.sellCount} продаж на ${fmt(p.sellUsd)}` : ""}
-                        {p.holdMinutes > 0 && ` · держал ${p.holdMinutes < 60 ? p.holdMinutes + "м" : (p.holdMinutes / 60).toFixed(1) + "ч"}`}
+
+              {/* Counterparties */}
+              <div className="bg-[#0d1117] border border-slate-800 rounded-xl overflow-hidden">
+                <div className="px-4 py-3 text-sm font-medium text-slate-300 border-b border-slate-800">
+                  Контрагенты по переводам ({counterparties.length})
+                </div>
+                <div className="divide-y divide-slate-800/50 max-h-[420px] overflow-y-auto">
+                  {counterparties.length === 0 && (
+                    <div className="px-4 py-8 text-center text-sm text-slate-600">Переводов с известными контрагентами не найдено</div>
+                  )}
+                  {counterparties.map(([addr, c]) => (
+                    <div key={addr} className="flex items-center gap-3 px-4 py-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <Link href={`/wallet/${addr}`} className="font-mono text-sm text-slate-200 hover:text-emerald-400 transition-colors">
+                            {shortAddr(addr)}
+                          </Link>
+                          <button onClick={() => copyAddress(addr)} className="text-slate-600 hover:text-emerald-400 text-xs" title="Скопировать">⎘</button>
+                        </div>
+                        <div className="text-[11px] text-slate-500">{c.count} перевод(ов) · последний {timeAgo(c.lastTs)}</div>
+                      </div>
+                      <div className="text-right shrink-0 text-xs space-y-0.5">
+                        {c.inUsd > 0 && <div className="text-sky-400">⬇ {fmtUsd(c.inUsd)}</div>}
+                        {c.outUsd > 0 && <div className="text-orange-400">⬆ {fmtUsd(c.outUsd)}</div>}
+                        {c.inUsd === 0 && c.outUsd === 0 && <div className="text-slate-600">сумма неизвестна</div>}
                       </div>
                     </div>
-                    <div className="text-right shrink-0">
-                      {p.status === "open" ? (
-                        <span className="text-xs text-yellow-400">открыта</span>
-                      ) : (
-                        <>
-                          <div className={`text-sm font-bold ${p.pnlUsd >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmt(p.pnlUsd)}</div>
-                          <div className={`text-xs ${p.pnlPct >= 0 ? "text-emerald-400/70" : "text-red-400/70"}`}>{p.pnlPct >= 0 ? "+" : ""}{p.pnlPct.toFixed(1)}%</div>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             </div>
 
-            {/* Full transaction table */}
+            {/* Full event table */}
             <div className="bg-[#0d1117] border border-slate-800 rounded-xl overflow-hidden">
-              <div className="px-4 py-3 text-sm font-medium text-slate-300 border-b border-slate-800">
-                Все транзакции ({trades.length})
+              <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 flex-wrap gap-2">
+                <span className="text-sm font-medium text-slate-300">Все события</span>
+                <div className="flex gap-1 bg-slate-900 rounded-lg p-1 flex-wrap">
+                  {FILTER_TABS.map((t) => (
+                    <button key={t.id} onClick={() => setTab(t.id)}
+                      className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+                        tab === t.id ? "bg-slate-700 text-white" : "text-slate-500 hover:text-slate-300"
+                      }`}>
+                      {t.label} <span className="text-slate-600">{tabCounts[t.id]}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className="hidden sm:grid grid-cols-[auto_1fr_auto_auto_auto_auto] gap-3 px-4 py-2 text-xs text-slate-500 border-b border-slate-800 font-medium uppercase tracking-wide">
-                <span>Тип</span><span>Токен</span><span className="text-right">USD</span>
-                <span className="text-right">Кол-во</span><span className="text-right">Время</span><span className="text-right">Tx</span>
+
+              <div className="hidden sm:grid grid-cols-[90px_1fr_110px_110px_130px_90px_40px] gap-3 px-4 py-2 text-[11px] text-slate-500 border-b border-slate-800 font-medium uppercase tracking-wide">
+                <span>Тип</span><span>Актив</span><span className="text-right">Сумма</span>
+                <span className="text-right">Кол-во</span><span>Контрагент</span><span className="text-right">Время</span><span className="text-right">Tx</span>
               </div>
-              <div className="divide-y divide-slate-800/50 max-h-[500px] overflow-y-auto">
-                {trades.map((t, i) => (
-                  <div key={t.signature + i} className="grid grid-cols-[auto_1fr_auto] sm:grid-cols-[auto_1fr_auto_auto_auto_auto] gap-3 px-4 py-2.5 items-center hover:bg-slate-800/20">
-                    <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${t.side === "buy" ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"}`}>
-                      {t.side === "buy" ? "КУПИЛ" : "ПРОДАЛ"}
-                    </span>
-                    <span className="text-sm text-slate-200 truncate">{t.symbol}</span>
-                    <span className="text-sm text-slate-300 text-right">{fmt(t.usd)}</span>
-                    <span className="hidden sm:block text-xs text-slate-500 text-right">{t.tokens >= 1000 ? (t.tokens / 1000).toFixed(1) + "K" : t.tokens.toFixed(2)}</span>
-                    <span className="hidden sm:block text-xs text-slate-500 text-right">{timeAgo(t.ts)}</span>
-                    <a
-                      href={`https://solscan.io/tx/${t.signature}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="hidden sm:block text-xs text-slate-600 hover:text-emerald-400 text-right transition-colors"
-                    >
-                      ↗
-                    </a>
-                  </div>
-                ))}
+
+              <div className="divide-y divide-slate-800/50 max-h-[560px] overflow-y-auto">
+                {filteredEvents.length === 0 && (
+                  <div className="px-4 py-10 text-center text-sm text-slate-600">Нет событий этого типа в загруженном окне</div>
+                )}
+                {filteredEvents.map((e, i) => {
+                  const meta = EVENT_META[e.type];
+                  const isSol = e.type === "sol_in" || e.type === "sol_out";
+                  return (
+                    <div key={e.signature + i} className="grid grid-cols-[90px_1fr_auto] sm:grid-cols-[90px_1fr_110px_110px_130px_90px_40px] gap-3 px-4 py-2.5 items-center hover:bg-slate-800/20">
+                      <span className={`text-[11px] font-bold px-1.5 py-1 rounded text-center ${meta.cls}`}>{meta.badge}</span>
+                      <span className="text-sm text-slate-200 truncate font-medium">{isSol ? "SOL" : (e.symbol || (e.mint ? e.mint.slice(0, 6) : "?"))}</span>
+                      <span className="text-sm text-slate-200 text-right font-semibold">
+                        {e.usd !== null && e.usd !== undefined ? (e.usdIsEstimate ? "~" : "") + fmtUsd(e.usd) : "—"}
+                      </span>
+                      <span className="hidden sm:block text-xs text-slate-500 text-right">
+                        {isSol ? (e.sol || 0).toFixed(3) + " ◎" : e.tokens ? fmtTokens(e.tokens) : "—"}
+                      </span>
+                      <span className="hidden sm:block text-xs">
+                        {e.counterparty ? (
+                          <Link href={`/wallet/${e.counterparty}`} className="font-mono text-slate-500 hover:text-emerald-400 transition-colors">
+                            {shortAddr(e.counterparty)}
+                          </Link>
+                        ) : (
+                          <span className="text-slate-700">—</span>
+                        )}
+                      </span>
+                      <span className="hidden sm:block text-xs text-slate-500 text-right whitespace-nowrap">{timeAgo(e.ts)}</span>
+                      <a href={`https://solscan.io/tx/${e.signature}`} target="_blank" rel="noopener noreferrer"
+                        className="hidden sm:block text-xs text-slate-600 hover:text-emerald-400 text-right transition-colors">↗</a>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
             {/* Load more */}
             <div className="flex flex-col items-center gap-2 mt-5">
-              {error && trades.length > 0 && <div className="text-xs text-red-400">{error}</div>}
+              {error && events.length > 0 && <div className="text-xs text-red-400">{error}</div>}
               {hasMore ? (
                 <button
                   onClick={() => nextBefore && loadPage(nextBefore, false)}

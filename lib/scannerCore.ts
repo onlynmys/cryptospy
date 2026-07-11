@@ -347,6 +347,9 @@ export interface RawHeliusTx {
     postBalances: number[];
     preTokenBalances?: { accountIndex: number; mint: string; owner?: string; uiTokenAmount: { uiAmount: number | null } }[];
     postTokenBalances?: { accountIndex: number; mint: string; owner?: string; uiTokenAmount: { uiAmount: number | null } }[];
+    // Versioned transactions pull extra accounts from address lookup tables;
+    // pre/postBalances cover accountKeys FOLLOWED BY these, in this order.
+    loadedAddresses?: { writable?: string[]; readonly?: string[] };
   };
   transaction: {
     message: { accountKeys: string[] };
