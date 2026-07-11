@@ -482,35 +482,70 @@ export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet?: strin
     const buyUsd = pos.buys.reduce((s, t) => s + t.usd, 0);
     const sellUsd = pos.sells.reduce((s, t) => s + t.usd, 0);
     const boughtTok = pos.buys.reduce((s, t) => s + t.tokens, 0);
-    const soldTok = pos.sells.reduce((s, t) => s + t.tokens, 0);
-    totalBuyUsd += buyUsd;
-    totalSellUsd += sellUsd;
-    buyCount += pos.buys.length;
 
     const allTs = [...pos.buys, ...pos.sells].map((t) => t.ts);
     const lastTs = Math.max(...allTs);
     const firstBuyTs = Math.min(...pos.buys.map((t) => t.ts));
 
     if (pos.sells.length) {
-      // Match sells against buys by token quantity (average-cost basis).
-      // "sellUsd - buyUsd" treated ANY sell as closing the whole position:
-      // selling 20% of a winning position looked like an 80% loss, and sells
-      // of tokens bought outside the window looked like free profit.
-      let pnl: number;
-      let costBasis: number;
+      // Walk the position CHRONOLOGICALLY with a running inventory
+      // (average-cost basis). A sell can only realize PnL against tokens
+      // already bought by that moment — matching by quantity alone paired
+      // sells with buys that happened AFTER them (real case: wallet sold
+      // pre-window tokens on the 8th, bought $7 worth on the 10th, and the
+      // old math credited the $7 buy with the whole $2.8K of sales →
+      // "+21,203%"). Sell portions with no covering inventory have an
+      // unknown cost basis and are ignored entirely.
+      const events = [
+        ...pos.buys.map((t) => ({ ...t, side: "buy" as const })),
+        ...pos.sells.map((t) => ({ ...t, side: "sell" as const })),
+      ].sort((a, b) => a.ts - b.ts);
+
+      const usableTokens = events.every((e) => e.tokens > 0);
+      let pnl = 0;
+      let matchedCost = 0;
+      let matchedProceeds = 0;
       let fullyClosed: boolean;
-      if (boughtTok > 0 && soldTok > 0) {
-        const matchedTok = Math.min(boughtTok, soldTok);
-        costBasis = buyUsd * (matchedTok / boughtTok);
-        const matchedProceeds = sellUsd * (matchedTok / soldTok);
-        pnl = matchedProceeds - costBasis;
-        fullyClosed = soldTok >= boughtTok * 0.95;
+
+      if (usableTokens) {
+        let invTok = 0;
+        let invCost = 0;
+        for (const e of events) {
+          if (e.side === "buy") {
+            invTok += e.tokens;
+            invCost += e.usd;
+          } else if (invTok > 0) {
+            const m = Math.min(e.tokens, invTok);
+            const proceeds = e.usd * (m / e.tokens);
+            const cost = invCost * (m / invTok);
+            matchedProceeds += proceeds;
+            matchedCost += cost;
+            invTok -= m;
+            invCost -= cost;
+          }
+          // sell with zero inventory: skipped — nothing it can close
+        }
+        pnl = matchedProceeds - matchedCost;
+        fullyClosed = invTok <= boughtTok * 0.05;
       } else {
-        // Token amounts unavailable — fall back to the old USD-only math.
-        costBasis = buyUsd;
+        // Token amounts unavailable — fall back to plain USD totals.
+        matchedCost = buyUsd;
+        matchedProceeds = sellUsd;
         pnl = sellUsd - buyUsd;
         fullyClosed = true;
       }
+
+      // Nothing matched at all (every sell predates every buy) — same as a
+      // sell-only position: no basis, no verdict.
+      if (matchedCost <= 0) continue;
+
+      // Volume totals count only what participates in the analysis: all buys,
+      // but just the MATCHED sell proceeds — gross sells include liquidations
+      // of pre-window holdings, which would make the totals irreconcilable
+      // with the position list (and inflate "Продано всего").
+      totalBuyUsd += buyUsd;
+      totalSellUsd += matchedProceeds;
+      buyCount += pos.buys.length;
 
       realizedPnl += pnl;
       if (fullyClosed) {
@@ -524,9 +559,9 @@ export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet?: strin
       positionInfos.push({
         mint,
         buyUsd: Math.round(buyUsd),
-        sellUsd: Math.round(sellUsd),
+        sellUsd: Math.round(matchedProceeds),
         pnlUsd: Math.round(pnl),
-        pnlPct: costBasis > 0 ? Math.round((pnl / costBasis) * 1000) / 10 : 0,
+        pnlPct: Math.round((pnl / matchedCost) * 1000) / 10,
         buyCount: pos.buys.length,
         sellCount: pos.sells.length,
         holdMinutes: Math.round(holdMin),
@@ -535,6 +570,8 @@ export function analyzeWallet(txns: HeliusTx[], solPrice: number, wallet?: strin
         status: fullyClosed ? "closed" : "open",
       });
     } else {
+      totalBuyUsd += buyUsd;
+      buyCount += pos.buys.length;
       positionInfos.push({
         mint,
         buyUsd: Math.round(buyUsd),
