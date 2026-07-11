@@ -30,7 +30,7 @@ interface ScanFilters {
   minTrades: number;
 }
 
-const DEFAULT_FILTERS: ScanFilters = { minWinRate: 60, minPnlUsd: 800, maxInactiveHours: 24, minTrades: 1 };
+const DEFAULT_FILTERS: ScanFilters = { minWinRate: 60, minPnlUsd: 800, maxInactiveHours: 6, minTrades: 1 };
 
 function parseFilters(req: NextRequest): ScanFilters {
   const q = req.nextUrl.searchParams;
@@ -131,6 +131,42 @@ async function heliusFetch(url: string, retries = 2): Promise<HeliusTx[]> {
     }
   }
   return [];
+}
+
+// Walk backwards through an address's transaction history page by page (via the
+// `before` signature cursor) until we reach `cutoffTs`, run out of pages, hit
+// `maxPages`, or blow through the shared time budget. Returns however much of the
+// window we managed to cover — for very high-volume programs (Jupiter) that may
+// only be the last few minutes; for quieter ones it can genuinely reach hours back.
+async function fetchSwapsWindow(
+  address: string,
+  apiKey: string,
+  cutoffTs: number,
+  maxPages: number,
+  deadlineMs: number,
+  onRequest: () => void
+): Promise<HeliusTx[]> {
+  const all: HeliusTx[] = [];
+  let before: string | undefined;
+
+  for (let page = 0; page < maxPages; page++) {
+    if (Date.now() > deadlineMs) break;
+
+    const url = `${HELIUS}/addresses/${address}/transactions?api-key=${apiKey}&type=SWAP&limit=100`
+      + (before ? `&before=${before}` : "");
+    onRequest();
+    const batch = await heliusFetch(url);
+    if (!batch.length) break;
+
+    all.push(...batch);
+    const oldest = batch[batch.length - 1];
+    if (oldest.timestamp < cutoffTs) break; // reached the window boundary
+    if (batch.length < 100) break; // no more history to page through
+    before = oldest.signature;
+    await sleep(150);
+  }
+
+  return all;
 }
 
 async function pool<T, R>(items: T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -390,16 +426,18 @@ export async function GET(req: NextRequest) {
 
   try {
     const solPrice = await getSolPrice();
-
-    // Step 1: pull the global swap stream from ALL major DEX programs (any pair, any token).
-    // This is a broad, unbiased sample — not limited to a few trending pairs.
-    const sourceTxLists = await pool(DEX_SOURCES, 5, (src) => {
-      heliusRequests++;
-      return heliusFetch(`${HELIUS}/addresses/${src.address}/transactions?api-key=${apiKey}&type=SWAP&limit=100`);
-    });
-
-    // Step 2: collect trader candidates from the stream within the configured window
     const windowAgo = Date.now() / 1000 - filters.maxInactiveHours * 3600;
+
+    // Step 1: walk backwards through EVERY major DEX program's history until we reach
+    // the configured window (or run out of time budget). For quiet programs this
+    // genuinely covers the full window; for firehoses like Jupiter it covers as much
+    // as the time budget allows and simply stops there.
+    const FEED_DEADLINE = scanStart + 35_000; // leave ~25s for wallet-candidate analysis
+    const sourceTxLists = await pool(DEX_SOURCES, 5, (src) =>
+      fetchSwapsWindow(src.address, apiKey, windowAgo, 10, FEED_DEADLINE, () => { heliusRequests++; })
+    );
+
+    // Step 2: collect trader candidates from everything fetched
     const walletActivity = new Map<string, { count: number; maxBuyUsd: number; totalUsd: number }>();
     let totalSwaps = 0;
 
@@ -421,9 +459,10 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // Rank candidates: prefer meaningful buyers, skip hyperactive bots (likely MEV/arb, not human traders)
+    // Rank candidates: prefer meaningful buyers, skip hyperactive bots (likely MEV/arb, not human traders).
+    // Threshold is scaled up from the old single-page version since the window now spans hours, not minutes.
     const candidates = Array.from(walletActivity.entries())
-      .filter(([, a]) => a.count <= 15)
+      .filter(([, a]) => a.count <= 50)
       .sort((a, b) => (b[1].totalUsd) - (a[1].totalUsd))
       .slice(0, 60)
       .map(([addr]) => addr);

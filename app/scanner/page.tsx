@@ -295,7 +295,7 @@ interface ScanFilters {
   minTrades: number;
 }
 
-const DEFAULT_FILTERS: ScanFilters = { minWinRate: 60, minPnl: 800, maxHours: 24, minTrades: 1 };
+const DEFAULT_FILTERS: ScanFilters = { minWinRate: 60, minPnl: 800, maxHours: 6, minTrades: 1 };
 
 function filtersToQuery(f: ScanFilters): string {
   return `minWinRate=${f.minWinRate}&minPnl=${f.minPnl}&maxHours=${f.maxHours}&minTrades=${f.minTrades}`;
