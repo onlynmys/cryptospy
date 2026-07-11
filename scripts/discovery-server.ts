@@ -332,8 +332,26 @@ async function runDiscoveryScan(): Promise<{ ok: boolean; newCount: number; tota
   scanning = true;
   try {
     const filters = loadFilters();
-    const candidates = getCandidates(filters.maxInactiveHours, 20, DISCOVERY_CANDIDATE_LIMIT);
+    // Explore NEW wallets on every scan. Taking the top-N by volume gave a
+    // STABLE list — consecutive scans re-analyzed the same 30 wallets (mostly
+    // straight from cache), found the same nothing, and left ~90% of the
+    // daily Helius budget unspent while the rest of the swap log went
+    // unexplored. Skipping recently-analyzed wallets turns the 48 scans/day
+    // into a rolling sweep of the whole candidate pool.
+    const pool = getCandidates(filters.maxInactiveHours, 20, 300);
+    const unexplored = pool.filter((a) => {
+      const c = walletCache.get(a);
+      return !c || Date.now() - c.ts >= 90 * 60 * 1000;
+    });
+    const candidates = unexplored.slice(0, DISCOVERY_CANDIDATE_LIMIT);
     const { allAnalyzed, scanInfo } = await runFullScan(HELIUS_API_KEY, candidates, walletCache);
+
+    // The cache only ever grows (rotation feeds it ~1.5K wallets/day) —
+    // trim the oldest entries so a long-running process doesn't bloat.
+    if (walletCache.size > 3000) {
+      const oldest = [...walletCache.entries()].sort((a, b) => a[1].ts - b[1].ts).slice(0, walletCache.size - 3000);
+      for (const [k] of oldest) walletCache.delete(k);
+    }
     heliusRequestsToday += scanInfo.heliusRequests;
     saveBudget();
 
