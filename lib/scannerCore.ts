@@ -463,7 +463,7 @@ export async function runFullScan(
   apiKey: string,
   candidates: string[],
   walletCache: Map<string, WalletCacheEntry>,
-  walletTtlMs = 20 * 60 * 1000
+  walletTtlMs = 90 * 60 * 1000
 ): Promise<{ allAnalyzed: SmartWallet[]; scanInfo: ScanInfo }> {
   const scanStart = Date.now();
   let heliusRequests = 0;

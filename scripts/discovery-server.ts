@@ -217,15 +217,38 @@ let scanning = false;
 let lastScanTs = 0;
 let lastScanInfo: Record<string, unknown> | null = null;
 
+// Hard daily ceiling on Helius spend from auto-discovery, independent of
+// cron-job.org's own schedule — this is what actually protects the credit
+// balance regardless of how often /trigger gets pinged. 2000/day leaves a
+// huge margin under the free tier's 1M/month even if every single request
+// costs several credits, while still comfortably covering 48 scheduled
+// triggers/day at ~30 candidates each (~1440 requests/day worst case).
+const DAILY_HELIUS_BUDGET = 2000;
+const DISCOVERY_CANDIDATE_LIMIT = 30;
+let heliusRequestsToday = 0;
+let budgetResetAt = Date.now() + 24 * 3600 * 1000;
+
 async function runDiscoveryScan(): Promise<{ ok: boolean; newCount: number; totalCount: number; info: unknown }> {
   if (scanning) return { ok: false, newCount: 0, totalCount: 0, info: { error: "already scanning" } };
   if (!HELIUS_API_KEY) return { ok: false, newCount: 0, totalCount: 0, info: { error: "no HELIUS_API_KEY set" } };
 
+  if (Date.now() > budgetResetAt) {
+    heliusRequestsToday = 0;
+    budgetResetAt = Date.now() + 24 * 3600 * 1000;
+  }
+  if (heliusRequestsToday >= DAILY_HELIUS_BUDGET) {
+    return {
+      ok: false, newCount: 0, totalCount: 0,
+      info: { error: `daily Helius budget (${DAILY_HELIUS_BUDGET}) reached, resets in ${Math.round((budgetResetAt - Date.now()) / 60000)}min` },
+    };
+  }
+
   scanning = true;
   try {
     const filters = loadFilters();
-    const candidates = getCandidates(filters.maxInactiveHours);
+    const candidates = getCandidates(filters.maxInactiveHours, 20, DISCOVERY_CANDIDATE_LIMIT);
     const { allAnalyzed, scanInfo } = await runFullScan(HELIUS_API_KEY, candidates, walletCache);
+    heliusRequestsToday += scanInfo.heliusRequests;
 
     const passes = makeFilterFn(filters);
     const qualifying = allAnalyzed.filter(passes);
@@ -349,7 +372,11 @@ const server = createServer(async (req, res) => {
     if (url.pathname === "/health" && req.method === "GET") {
       const oldest = swapLog.length ? Math.round((Date.now() / 1000 - swapLog[0].ts) / 60) : 0;
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest, feed: feedStats, dynamicPairsWatched: dynamicPairs.length }));
+      res.end(JSON.stringify({
+        ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest,
+        feed: feedStats, dynamicPairsWatched: dynamicPairs.length,
+        heliusBudget: { used: heliusRequestsToday, limit: DAILY_HELIUS_BUDGET, resetsInMin: Math.round((budgetResetAt - Date.now()) / 60000) },
+      }));
       return;
     }
 
