@@ -253,6 +253,25 @@ export function extractSwap(tx: HeliusTx, solPrice: number): { mint: string; usd
     const inp = swap.tokenInputs.find((t) => !STABLES.has(t.mint));
     if (inp) return { mint: inp.mint, usd: nativeOut * solPrice, side: "sell" };
   }
+
+  // No native SOL leg — many trades (especially larger ones) route through
+  // USDC/USDT instead of SOL entirely. Missing these was a real bug: it
+  // silently dropped a chunk of a wallet's real buy volume, making its PnL%
+  // look far larger than it actually was (small counted cost, full proceeds)
+  // and could even flip an actual loss into an apparent win.
+  const stableIn = swap.tokenInputs?.find((t) => STABLES.has(t.mint) && t.mint !== WSOL);
+  const nonStableOut = swap.tokenOutputs?.find((t) => !STABLES.has(t.mint));
+  if (stableIn && nonStableOut) {
+    const usd = Number(stableIn.rawTokenAmount.tokenAmount) / 10 ** stableIn.rawTokenAmount.decimals;
+    if (usd > 0.5) return { mint: nonStableOut.mint, usd, side: "buy" };
+  }
+  const stableOut = swap.tokenOutputs?.find((t) => STABLES.has(t.mint) && t.mint !== WSOL);
+  const nonStableIn = swap.tokenInputs?.find((t) => !STABLES.has(t.mint));
+  if (stableOut && nonStableIn) {
+    const usd = Number(stableOut.rawTokenAmount.tokenAmount) / 10 ** stableOut.rawTokenAmount.decimals;
+    if (usd > 0.5) return { mint: nonStableIn.mint, usd, side: "sell" };
+  }
+
   return null;
 }
 
@@ -298,34 +317,55 @@ export function extractSwapFromRaw(
   // Fee payer always pays the network fee out of their own balance — add it
   // back so we isolate the SOL that actually moved as part of the swap itself.
   const solDelta = (post - pre + (tx.meta.fee || 0)) / 1e9;
-  if (Math.abs(solDelta) < 0.0005) return null;
 
+  // Build per-mint balance deltas for the wallet's own token accounts, split
+  // into "real" (non-stable) tokens and stablecoins — we need both: the real
+  // token to identify what was traded, the stablecoin as an alternative
+  // pricing currency for trades that didn't route through SOL at all.
   const preTok = new Map<string, number>();
   for (const t of tx.meta.preTokenBalances || []) {
-    if (t.owner !== wallet || STABLES.has(t.mint)) continue;
+    if (t.owner !== wallet) continue;
     preTok.set(t.mint, t.uiTokenAmount.uiAmount ?? 0);
   }
   const postTok = new Map<string, number>();
   for (const t of tx.meta.postTokenBalances || []) {
-    if (t.owner !== wallet || STABLES.has(t.mint)) continue;
+    if (t.owner !== wallet) continue;
     postTok.set(t.mint, t.uiTokenAmount.uiAmount ?? 0);
   }
 
   let bestMint: string | null = null;
   let bestDelta = 0;
   for (const mint of new Set([...preTok.keys(), ...postTok.keys()])) {
+    if (STABLES.has(mint)) continue;
     const delta = (postTok.get(mint) ?? 0) - (preTok.get(mint) ?? 0);
     if (Math.abs(delta) > Math.abs(bestDelta)) { bestDelta = delta; bestMint = mint; }
   }
-  if (!bestMint || bestDelta === 0) return null;
 
-  // SOL down + token up = buy; SOL up + token down = sell. Anything else
-  // (both moved the same direction) isn't a clean swap — bail rather than guess.
-  const side: "buy" | "sell" = solDelta < 0 ? "buy" : "sell";
-  if (side === "buy" && bestDelta <= 0) return null;
-  if (side === "sell" && bestDelta >= 0) return null;
+  if (bestMint && bestDelta !== 0 && Math.abs(solDelta) >= 0.0005) {
+    // SOL down + token up = buy; SOL up + token down = sell.
+    const side: "buy" | "sell" = solDelta < 0 ? "buy" : "sell";
+    if ((side === "buy" && bestDelta > 0) || (side === "sell" && bestDelta < 0)) {
+      return { mint: bestMint, usd: Math.abs(solDelta) * solPrice, side, wallet, ts: tx.blockTime };
+    }
+  }
 
-  return { mint: bestMint, usd: Math.abs(solDelta) * solPrice, side, wallet, ts: tx.blockTime };
+  // No clean SOL leg — many trades (especially larger ones) route through
+  // USDC/USDT instead. Missing these silently undercounted a wallet's real
+  // buy volume, inflating its apparent PnL% (small counted cost, full
+  // proceeds) and could even flip an actual loss into an apparent win.
+  if (bestMint && bestDelta !== 0) {
+    const usdcDelta = (postTok.get(USDC) ?? 0) - (preTok.get(USDC) ?? 0);
+    const usdtDelta = (postTok.get(USDT) ?? 0) - (preTok.get(USDT) ?? 0);
+    const stableDelta = Math.abs(usdcDelta) >= Math.abs(usdtDelta) ? usdcDelta : usdtDelta;
+    if (Math.abs(stableDelta) >= 0.5) {
+      const side: "buy" | "sell" = stableDelta < 0 ? "buy" : "sell";
+      if ((side === "buy" && bestDelta > 0) || (side === "sell" && bestDelta < 0)) {
+        return { mint: bestMint, usd: Math.abs(stableDelta), side, wallet, ts: tx.blockTime };
+      }
+    }
+  }
+
+  return null;
 }
 
 function analyzeWallet(txns: HeliusTx[], solPrice: number) {
