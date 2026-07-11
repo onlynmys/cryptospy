@@ -1,20 +1,22 @@
 // Standalone service that runs on this VM (NOT on Vercel) so its data survives
 // between invocations. Two independent jobs happen here:
 //
-// 1. Continuous swap collection: Helius pushes every SWAP transaction touching
-//    our watched DEX programs to POST /webhook/helius in real time. We keep a
-//    rolling in-memory + on-disk log of them (pruned to RETENTION_HOURS). This
-//    is the ONLY way to genuinely cover hours of activity on busy programs
-//    like Jupiter — pulling history on demand via pagination tops out at a few
-//    seconds of coverage per page for those, no matter how many pages you walk.
+// 1. Continuous swap collection: a free Solana public-RPC WebSocket
+//    subscription (see solanaFeed.ts) streams logs for our watched DEX
+//    programs, and we pull the full transaction for each match — genuinely
+//    $0, no Helius credits involved at all. (We tried a Helius webhook here
+//    first; even in "raw" mode it burned through the free tier's credits
+//    far faster than expected, so we dropped Helius from this part entirely.)
+//    We keep a rolling in-memory + on-disk log of parsed swaps (pruned to
+//    SWAP_RETENTION_HOURS).
 //
 // 2. Discovery scanning: an external cron (cron-job.org) hits GET /trigger
-//    every ~30min. We pull candidates from the swap log (not the network),
-//    analyze each candidate's own full trade history via Helius, and keep a
-//    running "discoveries" list of wallets meeting a separately configurable,
-//    stricter filter. GET /candidates also serves the same candidate list to
-//    the Vercel-hosted manual Scanner page, so both features share one source
-//    of truth instead of Vercel trying (and failing) to re-derive it itself.
+//    every ~30min. We pull candidates from the swap log (free), then analyze
+//    each candidate's own full trade history via Helius (this part still
+//    needs Helius — it's a small, bounded number of calls per run, not a
+//    firehose) and keep a running "discoveries" list of wallets meeting a
+//    separately configurable, stricter filter. GET /candidates also serves
+//    the same candidate list to the Vercel-hosted manual Scanner page.
 //
 // Run persistently via: pm2 start ecosystem.config.cjs
 
@@ -26,15 +28,15 @@ import {
   makeFilterFn,
   getSolPrice,
   extractSwapFromRaw,
+  FREE_FEED_SOURCES,
   type ScanFilters,
   type SmartWallet,
   type WalletCacheEntry,
-  type RawHeliusTx,
 } from "../lib/scannerCore";
+import { startSolanaFeed, type FeedStats } from "./solanaFeed";
 
 const PORT = Number(process.env.DISCOVERY_PORT || 4001);
 const SECRET = process.env.DISCOVERY_SECRET || "";
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const DATA_DIR = join(__dirname, "..", "data");
 const DISCOVERIES_PATH = join(DATA_DIR, "discoveries.json");
@@ -126,7 +128,7 @@ function getCandidates(hours: number, minUsd = 20, limit = 80): string[] {
     .map(([addr]) => addr);
 }
 
-// Refresh SOL price every 2 min instead of hitting DEX Screener on every webhook delivery
+// Refresh SOL price every 2 min instead of hitting DEX Screener on every swap
 setInterval(() => { getSolPrice().then((p) => { solPriceCache = p; }).catch(() => {}); }, 2 * 60_000);
 getSolPrice().then((p) => { solPriceCache = p; }).catch(() => {});
 
@@ -134,12 +136,18 @@ getSolPrice().then((p) => { solPriceCache = p; }).catch(() => {});
 setInterval(() => { pruneSwapLog(); saveJson(SWAP_LOG_PATH, swapLog); }, 60_000);
 pruneSwapLog();
 
+// Free, credit-free swap collection via public Solana RPC (replaces the Helius webhook)
+const feedStats: FeedStats = startSolanaFeed(FREE_FEED_SOURCES.map((s) => s.address), (tx) => {
+  const swap = extractSwapFromRaw(tx, solPriceCache);
+  if (!swap || swap.usd < 20) return;
+  swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });
+});
+
 // ---------- discovery scanning ----------
 
 const walletCache = new Map<string, WalletCacheEntry>();
 
 let scanning = false;
-let loggedSample = false;
 let lastScanTs = 0;
 let lastScanInfo: Record<string, unknown> | null = null;
 
@@ -207,41 +215,6 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
   try {
-    // Helius calls this on every SWAP transaction touching our watched programs.
-    if (url.pathname === "/webhook/helius" && req.method === "POST") {
-      if (!WEBHOOK_SECRET || req.headers.authorization !== WEBHOOK_SECRET) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
-
-      let body = "";
-      for await (const chunk of req) body += chunk;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
-
-      if (process.env.LOG_RAW_WEBHOOK === "1" && !loggedSample) {
-        loggedSample = true;
-        writeFileSync(join(DATA_DIR, "raw-webhook-sample.json"), body);
-        console.log("logged raw webhook sample to data/raw-webhook-sample.json");
-      }
-
-      try {
-        const txs = JSON.parse(body) as RawHeliusTx[];
-        let added = 0;
-        for (const tx of Array.isArray(txs) ? txs : []) {
-          const swap = extractSwapFromRaw(tx, solPriceCache);
-          if (!swap || swap.usd < 20) continue;
-          swapLog.push({ ts: swap.ts, wallet: swap.wallet, usd: Math.round(swap.usd), side: swap.side });
-          added++;
-        }
-        if (added) console.log(`webhook: +${added} swaps (log size ${swapLog.length})`);
-      } catch (e) {
-        console.error("webhook parse error:", e);
-      }
-      return;
-    }
-
     if (url.pathname === "/trigger" && req.method === "GET") {
       if (url.searchParams.get("secret") !== SECRET || !SECRET) {
         res.writeHead(401, { "Content-Type": "application/json" });
@@ -310,7 +283,7 @@ const server = createServer(async (req, res) => {
     if (url.pathname === "/health" && req.method === "GET") {
       const oldest = swapLog.length ? Math.round((Date.now() / 1000 - swapLog[0].ts) / 60) : 0;
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest }));
+      res.end(JSON.stringify({ ok: true, lastScanTs, scanning, swapLogSize: swapLog.length, oldestSwapMinutesAgo: oldest, feed: feedStats }));
       return;
     }
 
@@ -327,6 +300,5 @@ server.listen(PORT, () => {
   console.log(`discovery-server listening on :${PORT}`);
   console.log(`HELIUS_API_KEY set: ${!!HELIUS_API_KEY}`);
   console.log(`DISCOVERY_SECRET set: ${!!SECRET}`);
-  console.log(`WEBHOOK_SECRET set: ${!!WEBHOOK_SECRET}`);
   console.log(`swap log loaded: ${swapLog.length} entries`);
 });

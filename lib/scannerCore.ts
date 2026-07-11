@@ -14,13 +14,25 @@ const STABLES = new Set([WSOL, USDC, USDT]);
 
 // Global swap feeds — DEX program addresses (any pair, any token).
 // Pulling from many programs at once = a broad, unbiased sample of ALL Solana traders,
-// not just whoever happens to be trading on a handful of trending pairs.
+// not just whoever happens to be trending pairs. Kept as the "full" reference
+// list even though the free feed below only watches a subset of it.
 export const DEX_SOURCES = [
   { name: "Jupiter", address: "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4" },
   { name: "Raydium AMM", address: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" },
   { name: "Raydium CLMM", address: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },
   { name: "PumpSwap", address: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA" },
   { name: "Pump.fun", address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" },
+  { name: "Orca Whirlpool", address: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" },
+  { name: "Meteora DLMM", address: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo" },
+];
+
+// Free public Solana RPC can't keep up with all 7 (measured: subscribing to
+// all of them dropped 13,720 of 13,740 matched transactions in ~90 seconds —
+// Jupiter and PumpSwap alone produce far more volume than a single shared,
+// rate-limited endpoint can fetch full transactions for). Trimmed to the
+// quieter programs so we actually capture a usable fraction of what we see.
+export const FREE_FEED_SOURCES = [
+  { name: "Raydium CLMM", address: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },
   { name: "Orca Whirlpool", address: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" },
   { name: "Meteora DLMM", address: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo" },
 ];
