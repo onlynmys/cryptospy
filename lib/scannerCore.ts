@@ -188,14 +188,31 @@ async function pool<T, R>(items: T[], concurrency: number, fn: (item: T) => Prom
   return results;
 }
 
+// Fallback only, used if the live fetch fails entirely — deliberately not
+// treated as "close enough" anywhere else, since SOL's price moves too much
+// for a hardcoded number to stay accurate for long.
+const SOL_PRICE_FALLBACK = 80;
+
 export async function getSolPrice(): Promise<number> {
   try {
     const r = await fetch(`${DEX}/latest/dex/tokens/${WSOL}`);
-    if (!r.ok) return 170;
+    if (!r.ok) return SOL_PRICE_FALLBACK;
     const d = await r.json();
-    const p = parseFloat(d.pairs?.[0]?.priceUsd || "0");
-    return p > 1 ? p : 170;
-  } catch { return 170; }
+    const pairs = (d.pairs || []) as { quoteToken?: { symbol?: string }; priceUsd?: string; liquidity?: { usd?: number } }[];
+
+    // WSOL's /tokens/ endpoint returns EVERY pair involving the address as
+    // either side, across every DEX — pairs[0] is not necessarily SOL/USDC
+    // (bug: it previously picked whatever came first, occasionally an
+    // unrelated low-liquidity pair, silently corrupting every dollar figure
+    // downstream by whatever factor that pair's price was off by). Restrict
+    // to genuine SOL/stablecoin pairs and take the most liquid one.
+    const solStablePairs = pairs.filter((p) =>
+      (p.quoteToken?.symbol === "USDC" || p.quoteToken?.symbol === "USDT") && (p.liquidity?.usd || 0) > 10_000
+    );
+    const best = solStablePairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+    const p = parseFloat(best?.priceUsd || "0");
+    return p > 1 ? p : SOL_PRICE_FALLBACK;
+  } catch { return SOL_PRICE_FALLBACK; }
 }
 
 const symbolCache = new Map<string, string>();

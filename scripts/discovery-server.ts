@@ -169,7 +169,7 @@ function pruneDiscoveries(records: DiscoveryRecord[]): DiscoveryRecord[] {
 // ---------- swap log (webhook-fed, in-memory + periodic disk snapshot) ----------
 
 let swapLog: SwapLogEntry[] = loadJson<SwapLogEntry[]>(SWAP_LOG_PATH, []);
-let solPriceCache = 170;
+let solPriceCache = 80; // overwritten within 2 min by the real price fetch below
 
 function pruneSwapLog() {
   const cutoff = Date.now() / 1000 - SWAP_RETENTION_HOURS * 3600;
