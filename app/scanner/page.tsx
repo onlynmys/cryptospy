@@ -288,6 +288,19 @@ interface ScanMeta {
   lastScanTs?: number;
 }
 
+interface ScanFilters {
+  minWinRate: number;
+  minPnl: number;
+  maxHours: number;
+  minTrades: number;
+}
+
+const DEFAULT_FILTERS: ScanFilters = { minWinRate: 60, minPnl: 800, maxHours: 24, minTrades: 1 };
+
+function filtersToQuery(f: ScanFilters): string {
+  return `minWinRate=${f.minWinRate}&minPnl=${f.minPnl}&maxHours=${f.maxHours}&minTrades=${f.minTrades}`;
+}
+
 export default function ScannerPage() {
   const [wallets, setWallets] = useState<SmartWallet[]>([]);
   const [loading, setLoading] = useState(false);
@@ -297,13 +310,28 @@ export default function ScannerPage() {
   const [sortBy, setSortBy] = useState<"score" | "winRate" | "pnl">("score");
   const [filterTag, setFilterTag] = useState("");
   const [page, setPage] = useState(1);
+  const [filters, setFilters] = useState<ScanFilters>(DEFAULT_FILTERS);
+  const [showFilters, setShowFilters] = useState(false);
   const PER_PAGE = 10;
 
+  // Load saved filter settings once
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("scanner_filters");
+      if (saved) setFilters({ ...DEFAULT_FILTERS, ...JSON.parse(saved) });
+    } catch { /* ignore */ }
+  }, []);
+
+  function updateFilters(next: ScanFilters) {
+    setFilters(next);
+    localStorage.setItem("scanner_filters", JSON.stringify(next));
+  }
+
   // Manual scan — the only thing that spends Helius credits
-  const scan = useCallback(async () => {
+  const scan = useCallback(async (f: ScanFilters) => {
     setLoading(true);
     try {
-      const r = await fetch(`/api/scanner?refresh=1`);
+      const r = await fetch(`/api/scanner?refresh=1&${filtersToQuery(f)}`);
       const d = await r.json();
       setWallets(d.wallets || []);
       setMeta(d);
@@ -314,17 +342,32 @@ export default function ScannerPage() {
     }
   }, []);
 
+  // Re-apply filters against the cached (already analyzed) wallet pool — zero Helius cost
+  const applyFiltersFromCache = useCallback(async (f: ScanFilters) => {
+    try {
+      const r = await fetch(`/api/scanner?mode=cached&${filtersToQuery(f)}`);
+      const d = await r.json();
+      setWallets(d.wallets || []);
+      setMeta(d);
+      if (d.lastScanTs) setLastScan(new Date(d.lastScanTs));
+      setPage(1);
+    } catch { /* ignore */ }
+  }, []);
+
   // On page load: show cached results only, zero Helius requests
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch(`/api/scanner?mode=cached`);
+        const saved = localStorage.getItem("scanner_filters");
+        const f: ScanFilters = saved ? { ...DEFAULT_FILTERS, ...JSON.parse(saved) } : DEFAULT_FILTERS;
+        const r = await fetch(`/api/scanner?mode=cached&${filtersToQuery(f)}`);
         const d = await r.json();
         setWallets(d.wallets || []);
         setMeta(d);
         if (d.lastScanTs) setLastScan(new Date(d.lastScanTs));
       } catch { /* ignore */ }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function copyAddr(addr: string) {
@@ -363,7 +406,7 @@ export default function ScannerPage() {
           <div>
             <h1 className="text-2xl font-bold text-white flex items-center gap-2">🧠 Smart Money Scanner</h1>
             <p className="text-slate-500 text-sm mt-1">
-              Кошельки активные за 24ч · PnL ≥ $800 · Win Rate ≥ 60%
+              Win Rate ≥ {filters.minWinRate}% · PnL ≥ ${filters.minPnl} · активность {filters.maxHours}ч · сделок ≥ {filters.minTrades}
             </p>
             {lastScan && (
               <p className="text-slate-600 text-xs mt-1">
@@ -382,7 +425,15 @@ export default function ScannerPage() {
               </span>
             )}
             <button
-              onClick={scan}
+              onClick={() => setShowFilters(!showFilters)}
+              className={`px-3 py-2 rounded-xl text-sm font-medium transition-all border ${
+                showFilters ? "bg-slate-700 text-white border-slate-600" : "border-slate-700 text-slate-400 hover:text-white"
+              }`}
+            >
+              ⚙ Фильтры
+            </button>
+            <button
+              onClick={() => scan(filters)}
               disabled={loading}
               className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-black font-semibold rounded-xl text-sm transition-all flex items-center gap-2"
             >
@@ -392,6 +443,84 @@ export default function ScannerPage() {
             </button>
           </div>
         </div>
+
+        {/* Filter settings panel */}
+        {showFilters && (
+          <div className="bg-[#0d1117] border border-slate-700 rounded-xl p-4 mb-5">
+            <div className="text-sm font-medium text-slate-300 mb-3">Настройки фильтра</div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div>
+                <label className="text-xs text-slate-500 block mb-1.5">Мин. Win Rate</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number" min={0} max={100} step={5}
+                    value={filters.minWinRate}
+                    onChange={(e) => updateFilters({ ...filters, minWinRate: Number(e.target.value) })}
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  />
+                  <span className="text-xs text-slate-500 shrink-0">%</span>
+                </div>
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 block mb-1.5">Мин. PnL</label>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-slate-500 shrink-0">$</span>
+                  <input
+                    type="number" min={0} step={100}
+                    value={filters.minPnl}
+                    onChange={(e) => updateFilters({ ...filters, minPnl: Number(e.target.value) })}
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 block mb-1.5">Активность за</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number" min={1} max={168} step={1}
+                    value={filters.maxHours}
+                    onChange={(e) => updateFilters({ ...filters, maxHours: Number(e.target.value) })}
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  />
+                  <span className="text-xs text-slate-500 shrink-0">ч</span>
+                </div>
+              </div>
+              <div>
+                <label className="text-xs text-slate-500 block mb-1.5">Мин. сделок</label>
+                <input
+                  type="number" min={1} step={1}
+                  value={filters.minTrades}
+                  onChange={(e) => updateFilters({ ...filters, minTrades: Number(e.target.value) })}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 mt-3 flex-wrap">
+              <span className="text-xs text-slate-600">Пресеты:</span>
+              {[
+                { label: "Строгий", f: { minWinRate: 70, minPnl: 2000, maxHours: 24, minTrades: 3 } },
+                { label: "Стандарт", f: DEFAULT_FILTERS },
+                { label: "Мягкий", f: { minWinRate: 50, minPnl: 100, maxHours: 48, minTrades: 1 } },
+                { label: "Только сегодня", f: { minWinRate: 55, minPnl: 300, maxHours: 6, minTrades: 1 } },
+              ].map((p) => (
+                <button
+                  key={p.label}
+                  onClick={() => updateFilters(p.f)}
+                  className="text-xs px-2.5 py-1 rounded-lg border border-slate-700 text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
+                >
+                  {p.label}
+                </button>
+              ))}
+              <button
+                onClick={() => applyFiltersFromCache(filters)}
+                className="ml-auto text-xs px-3 py-1.5 rounded-lg bg-slate-800 text-emerald-400 hover:bg-slate-700 transition-colors font-medium"
+              >
+                ↻ Применить к текущим данным (бесплатно)
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Scan report */}
         {meta && !meta.cached && meta.heliusRequests !== undefined && (

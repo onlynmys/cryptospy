@@ -10,13 +10,43 @@ const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const STABLES = new Set([WSOL, USDC, USDT]);
 
-// Global swap feeds — DEX program addresses (any pair, any token)
+// Global swap feeds — DEX program addresses (any pair, any token).
+// Pulling from many programs at once = a broad, unbiased sample of ALL Solana traders,
+// not just whoever happens to be trading on a handful of trending pairs.
 const DEX_SOURCES = [
   { name: "Jupiter", address: "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4" },
-  { name: "Raydium", address: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" },
+  { name: "Raydium AMM", address: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" },
+  { name: "Raydium CLMM", address: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },
   { name: "PumpSwap", address: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA" },
-  { name: "Orca", address: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" },
+  { name: "Pump.fun", address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P" },
+  { name: "Orca Whirlpool", address: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" },
+  { name: "Meteora DLMM", address: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo" },
 ];
+
+interface ScanFilters {
+  minWinRate: number;
+  minPnlUsd: number;
+  maxInactiveHours: number;
+  minTrades: number;
+}
+
+const DEFAULT_FILTERS: ScanFilters = { minWinRate: 60, minPnlUsd: 800, maxInactiveHours: 24, minTrades: 1 };
+
+function parseFilters(req: NextRequest): ScanFilters {
+  const q = req.nextUrl.searchParams;
+  const num = (key: string, fallback: number) => {
+    const v = q.get(key);
+    if (v === null) return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  return {
+    minWinRate: num("minWinRate", DEFAULT_FILTERS.minWinRate),
+    minPnlUsd: num("minPnl", DEFAULT_FILTERS.minPnlUsd),
+    maxInactiveHours: num("maxHours", DEFAULT_FILTERS.maxInactiveHours),
+    minTrades: num("minTrades", DEFAULT_FILTERS.minTrades),
+  };
+}
 
 export interface TokenPositionInfo {
   mint: string;
@@ -166,14 +196,17 @@ function extractSwap(tx: HeliusTx, wallet: string, solPrice: number): { mint: st
     const nativeIn = swap.nativeInput && Number(swap.nativeInput.amount) / 1e9;
     const nativeOut = swap.nativeOutput && Number(swap.nativeOutput.amount) / 1e9;
 
+    // Only count as a "buy/sell" if the other side is an actual (non-stable) token.
+    // SOL<->USDC or USDC<->USDT are currency conversions, not memecoin trades.
     if (nativeIn && nativeIn > 0.0005 && swap.tokenOutputs?.length) {
-      const out = swap.tokenOutputs.find((t) => !STABLES.has(t.mint)) || swap.tokenOutputs[0];
-      return { mint: out.mint, usd: nativeIn * solPrice, side: "buy" };
+      const out = swap.tokenOutputs.find((t) => !STABLES.has(t.mint));
+      if (out) return { mint: out.mint, usd: nativeIn * solPrice, side: "buy" };
     }
     if (nativeOut && nativeOut > 0.0005 && swap.tokenInputs?.length) {
-      const inp = swap.tokenInputs.find((t) => !STABLES.has(t.mint)) || swap.tokenInputs[0];
-      return { mint: inp.mint, usd: nativeOut * solPrice, side: "sell" };
+      const inp = swap.tokenInputs.find((t) => !STABLES.has(t.mint));
+      if (inp) return { mint: inp.mint, usd: nativeOut * solPrice, side: "sell" };
     }
+    return null;
   }
 
   const solSent = (tx.nativeTransfers || []).filter((t) => t.fromUserAccount === wallet).reduce((s, t) => s + t.amount, 0) / 1e9;
@@ -304,6 +337,7 @@ export async function GET(req: NextRequest) {
   const apiKey = process.env.HELIUS_API_KEY;
   const mode = req.nextUrl.searchParams.get("mode");
   const forceRefresh = req.nextUrl.searchParams.get("refresh") === "1";
+  const filters = parseFilters(req);
 
   if (!apiKey) {
     return NextResponse.json({
@@ -314,11 +348,14 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  // Cached mode: return last scan results WITHOUT touching Helius (0 credits)
+  // Cached mode: return last scan results WITHOUT touching Helius (0 credits),
+  // re-applying whatever filters are currently set in the UI.
   if (mode === "cached") {
     if (lastGoodScan) {
+      const passesFilter = makeFilterFn(filters);
+      const filteredWallets = lastGoodScan.wallets.filter(passesFilter);
       return NextResponse.json({
-        wallets: lastGoodScan.wallets,
+        wallets: filteredWallets,
         real: true,
         hasApiKey: true,
         cached: true,
@@ -337,8 +374,9 @@ export async function GET(req: NextRequest) {
   }
 
   if (!forceRefresh && lastGoodScan && Date.now() - lastGoodScan.ts < SCAN_TTL) {
+    const passesFilter = makeFilterFn(filters);
     return NextResponse.json({
-      wallets: lastGoodScan.wallets,
+      wallets: lastGoodScan.wallets.filter(passesFilter),
       real: true,
       hasApiKey: true,
       cached: true,
@@ -353,14 +391,15 @@ export async function GET(req: NextRequest) {
   try {
     const solPrice = await getSolPrice();
 
-    // Step 1: pull the global swap stream from all major DEX programs (any pair, any token)
-    const sourceTxLists = await pool(DEX_SOURCES, 4, (src) => {
+    // Step 1: pull the global swap stream from ALL major DEX programs (any pair, any token).
+    // This is a broad, unbiased sample — not limited to a few trending pairs.
+    const sourceTxLists = await pool(DEX_SOURCES, 5, (src) => {
       heliusRequests++;
       return heliusFetch(`${HELIUS}/addresses/${src.address}/transactions?api-key=${apiKey}&type=SWAP&limit=100`);
     });
 
-    // Step 2: collect trader candidates from the stream (24h window)
-    const DAY_AGO = Date.now() / 1000 - 24 * 3600;
+    // Step 2: collect trader candidates from the stream within the configured window
+    const windowAgo = Date.now() / 1000 - filters.maxInactiveHours * 3600;
     const walletActivity = new Map<string, { count: number; maxBuyUsd: number; totalUsd: number }>();
     let totalSwaps = 0;
 
@@ -369,7 +408,7 @@ export async function GET(req: NextRequest) {
         totalSwaps++;
         const maker = tx.feePayer;
         if (!maker || maker.length < 32) continue;
-        if (tx.timestamp < DAY_AGO) continue;
+        if (tx.timestamp < windowAgo) continue;
 
         const swap = extractSwap(tx, maker, solPrice);
         if (!swap || swap.usd < 20) continue;
@@ -382,15 +421,15 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // Rank candidates: prefer meaningful buyers, skip hyperactive bots (>15 swaps in feed)
+    // Rank candidates: prefer meaningful buyers, skip hyperactive bots (likely MEV/arb, not human traders)
     const candidates = Array.from(walletActivity.entries())
       .filter(([, a]) => a.count <= 15)
       .sort((a, b) => (b[1].totalUsd) - (a[1].totalUsd))
-      .slice(0, 40)
+      .slice(0, 60)
       .map(([addr]) => addr);
 
     if (!candidates.length) {
-      return respondWithFallback("Не найдено активных трейдеров в потоке свопов — попробуй через минуту");
+      return respondWithFallback("Не найдено активных трейдеров в потоке свопов — попробуй через минуту", filters);
     }
 
     // Step 3: analyze each candidate's own trade history (cached when fresh)
@@ -406,7 +445,7 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    const walletTxLists = await pool(toFetch, 3, (addr) => {
+    const walletTxLists = await pool(toFetch, 4, (addr) => {
       heliusRequests++;
       return heliusFetch(`${HELIUS}/addresses/${addr}/transactions?api-key=${apiKey}&type=SWAP&limit=100`);
     });
@@ -422,11 +461,8 @@ export async function GET(req: NextRequest) {
       const totalTrades = stats.wins + stats.losses;
       if (totalTrades < 1) { rejectedCount++; return; }
 
-      const winRate = Math.round((stats.wins / totalTrades) * 100);
-      const activeRecently = Date.now() / 1000 - stats.lastActivity < 24 * 3600;
-      // Strict filter: PnL >= $800, Win Rate >= 60%, active in last 24h
-      if (stats.totalPnlUsd < 800 || winRate < 60 || !activeRecently) { rejectedCount++; return; }
-
+      // Analyze everyone that has at least one closed trade — filtering happens later,
+      // so cached wallets can be re-filtered without re-fetching when the user tweaks settings.
       pendingWallets.push({ addr, stats });
     });
 
@@ -499,33 +535,37 @@ export async function GET(req: NextRequest) {
       results.push(wallet);
     }
 
-    // Keep only wallets passing the strict filter (also re-check cached ones)
-    const passesFilter = (w: SmartWallet) =>
-      w.totalPnlUsd >= 800 && w.winRate >= 60 && Date.now() / 1000 - w.lastActivity < 24 * 3600;
-
-    const passing = results.filter(passesFilter);
-    const sorted = passing.sort((a, b) => b.score - a.score).slice(0, 40);
-
-    let finalList = sorted;
+    // Merge newly analyzed wallets with everything kept from previous scans
+    // (unfiltered — filters are applied afterward so the UI can adjust them freely
+    // without re-spending Helius credits).
+    const merged = new Map<string, SmartWallet>();
     if (lastGoodScan) {
-      const have = new Set(sorted.map((w) => w.address));
-      const carryOver = lastGoodScan.wallets.filter((w) => !have.has(w.address) && passesFilter(w));
-      finalList = [...sorted, ...carryOver].sort((a, b) => b.score - a.score).slice(0, 50);
+      for (const w of lastGoodScan.wallets) merged.set(w.address, w);
     }
+    for (const w of results) merged.set(w.address, w);
 
-    if (finalList.length > 0) {
-      lastGoodScan = {
-        wallets: finalList,
-        ts: Date.now(),
-        scannedSwaps: totalSwaps,
-        scannedWallets: candidates.length,
-      };
-    }
+    // Drop wallets that are too stale to matter regardless of filter settings
+    const STALE_CUTOFF = Date.now() / 1000 - 72 * 3600;
+    const allAnalyzed = Array.from(merged.values())
+      .filter((w) => w.lastActivity >= STALE_CUTOFF)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 150);
+
+    lastGoodScan = {
+      wallets: allAnalyzed,
+      ts: Date.now(),
+      scannedSwaps: totalSwaps,
+      scannedWallets: candidates.length,
+    };
+
+    const passesFilter = makeFilterFn(filters);
+    const finalList = allAnalyzed.filter(passesFilter);
 
     const scanInfo = {
       scannedSwaps: totalSwaps,
       scannedWallets: candidates.length,
-      passedFilter: passing.length,
+      passedFilter: finalList.length,
+      analyzedTotal: allAnalyzed.length,
       rejected: rejectedCount,
       heliusRequests,
       durationSec: Math.round((Date.now() - scanStart) / 1000),
@@ -537,7 +577,7 @@ export async function GET(req: NextRequest) {
         real: true,
         hasApiKey: true,
         ...scanInfo,
-        message: `Проверено ${candidates.length} трейдеров из ${totalSwaps} свежих свопов — ни один не прошёл фильтр (PnL ≥ $800, Win Rate ≥ 60%, активность 24ч). Сканируй в разное время — результаты накапливаются.`,
+        message: `Проверено ${candidates.length} трейдеров из ${totalSwaps} свежих свопов — ни один не прошёл текущий фильтр. Попробуй ослабить фильтры или сканируй в разное время.`,
       });
     }
 
@@ -549,14 +589,24 @@ export async function GET(req: NextRequest) {
     });
   } catch (e) {
     console.error("Scanner error:", e);
-    return respondWithFallback("Ошибка сканирования — показаны последние результаты");
+    return respondWithFallback("Ошибка сканирования — показаны последние результаты", filters);
   }
 }
 
-function respondWithFallback(message: string) {
+function makeFilterFn(filters: ScanFilters) {
+  const cutoff = Date.now() / 1000 - filters.maxInactiveHours * 3600;
+  return (w: SmartWallet) =>
+    w.totalPnlUsd >= filters.minPnlUsd &&
+    w.winRate >= filters.minWinRate &&
+    w.totalTrades >= filters.minTrades &&
+    w.lastActivity >= cutoff;
+}
+
+function respondWithFallback(message: string, filters: ScanFilters = DEFAULT_FILTERS) {
   if (lastGoodScan && lastGoodScan.wallets.length) {
+    const passesFilter = makeFilterFn(filters);
     return NextResponse.json({
-      wallets: lastGoodScan.wallets,
+      wallets: lastGoodScan.wallets.filter(passesFilter),
       real: true,
       hasApiKey: true,
       cached: true,
