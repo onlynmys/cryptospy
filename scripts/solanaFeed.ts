@@ -12,7 +12,11 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import type { RawHeliusTx } from "../lib/scannerCore";
 
-const POLL_INTERVAL_MS = 15_000;
+// 30s (was 15s): halves the standing getSignaturesForAddress load. For
+// candidate discovery a swap being noticed 30s later changes nothing, and
+// RPC compute units are the actual scarce resource here — the feed's
+// getTransaction volume was on track to exhaust Alchemy's monthly free cap.
+const POLL_INTERVAL_MS = 30_000;
 const SIG_LIMIT = 40; // per address per poll — if it produces more than this in one interval, we miss the overflow
 const MAX_TX_FETCH_PER_SEC = 5;
 const ADDRESS_STAGGER_MS = 800; // spacing between getSignaturesForAddress calls within one poll cycle
@@ -33,26 +37,95 @@ export interface FeedStats {
 
 interface SigEntry { signature: string; err: unknown | null }
 
-async function rpcCall(rpcUrl: string, method: string, params: unknown[]): Promise<unknown> {
-  const res = await fetch(rpcUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (res.status === 429) {
-    const err = new Error("rate_limited") as Error & { rateLimited: true };
-    err.rateLimited = true;
+// ---------- multi-endpoint RPC pool with failover ----------
+//
+// One free-tier provider is a single point of failure: when Alchemy starts
+// returning 429/401 (per-second throttle or the monthly compute-unit cap),
+// everything built on it goes blind at once. The pool tries endpoints in
+// order, puts a misbehaving one on cooldown, and moves to the next. A
+// per-endpoint daily call cap keeps a long Alchemy outage from silently
+// draining the backup provider's budget too (Helius standard RPC spends the
+// same credits the discovery scans need).
+
+export interface RpcEndpoint {
+  name: string;
+  url: string;
+  dailyLimit?: number;
+}
+
+export interface RpcPool {
+  call: (method: string, params: unknown[], timeoutMs?: number) => Promise<unknown>;
+  status: () => { name: string; usedToday: number; dailyLimit: number | null; cooldownForSec: number }[];
+}
+
+const ENDPOINT_COOLDOWN_MS = 90_000;
+
+export function makeRpcPool(endpoints: RpcEndpoint[]): RpcPool {
+  const cooldownUntil = new Map<string, number>();
+  const usedToday = new Map<string, number>();
+  let dayResetAt = Date.now() + 24 * 3600 * 1000;
+
+  async function rawCall(url: string, method: string, params: unknown[], timeoutMs: number): Promise<unknown> {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status === 429 || res.status === 401 || res.status === 403) {
+      // 401/403 show up when a provider's plan limit trips, not just bad
+      // keys — treat all three as "this endpoint needs a rest".
+      const err = new Error(`limited_${res.status}`) as Error & { rateLimited: true };
+      err.rateLimited = true;
+      throw err;
+    }
+    if (!res.ok) throw new Error(`http_${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error.message || "rpc_error");
+    return data.result;
+  }
+
+  async function call(method: string, params: unknown[], timeoutMs = 10_000): Promise<unknown> {
+    if (Date.now() > dayResetAt) {
+      usedToday.clear();
+      dayResetAt = Date.now() + 24 * 3600 * 1000;
+    }
+    let lastErr: unknown = null;
+    for (const ep of endpoints) {
+      if (Date.now() < (cooldownUntil.get(ep.name) || 0)) continue;
+      if (ep.dailyLimit && (usedToday.get(ep.name) || 0) >= ep.dailyLimit) continue;
+      usedToday.set(ep.name, (usedToday.get(ep.name) || 0) + 1);
+      try {
+        return await rawCall(ep.url, method, params, timeoutMs);
+      } catch (e) {
+        lastErr = e;
+        if ((e as { rateLimited?: boolean }).rateLimited) {
+          cooldownUntil.set(ep.name, Date.now() + ENDPOINT_COOLDOWN_MS);
+          continue; // next endpoint picks this call up immediately
+        }
+        throw e; // genuine RPC error — not the endpoint's health, don't rotate
+      }
+    }
+    // Every endpoint is cooling down or capped
+    const err = (lastErr as Error) || new Error("all_endpoints_limited");
+    (err as Error & { rateLimited?: boolean }).rateLimited = true;
     throw err;
   }
-  if (!res.ok) throw new Error(`http_${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message || "rpc_error");
-  return data.result;
+
+  return {
+    call,
+    status: () =>
+      endpoints.map((ep) => ({
+        name: ep.name,
+        usedToday: usedToday.get(ep.name) || 0,
+        dailyLimit: ep.dailyLimit ?? null,
+        cooldownForSec: Math.max(0, Math.round(((cooldownUntil.get(ep.name) || 0) - Date.now()) / 1000)),
+      })),
+  };
 }
 
 export function startSolanaFeed(
-  rpcUrl: string,
+  pool: RpcPool,
   getAddresses: () => string[],
   onSwap: (tx: RawHeliusTx) => void,
   // Where to persist the per-address "last seen signature" cursors. Without
@@ -98,7 +171,7 @@ export function startSolanaFeed(
         const batch = txQueue.splice(0, MAX_TX_FETCH_PER_SEC);
         await Promise.all(batch.map(async (sig) => {
           try {
-            const tx = await rpcCall(rpcUrl, "getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
+            const tx = await pool.call("getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
             if (tx) { stats.fetched++; onSwap(tx as RawHeliusTx); }
             sigRetries.delete(sig);
           } catch (e) {
@@ -138,7 +211,7 @@ export function startSolanaFeed(
       const until = lastSignature.get(address);
       if (until) params[1].until = until;
 
-      const result = await rpcCall(rpcUrl, "getSignaturesForAddress", params) as SigEntry[];
+      const result = await pool.call("getSignaturesForAddress", params) as SigEntry[];
       if (!Array.isArray(result) || result.length === 0) return;
 
       lastSignature.set(address, result[0].signature); // newest-first

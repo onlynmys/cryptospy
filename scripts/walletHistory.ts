@@ -13,6 +13,7 @@
 // foreign trades to the wallet being viewed.
 
 import { WSOL, type RawHeliusTx } from "../lib/scannerCore";
+import type { RpcPool } from "./solanaFeed";
 
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
@@ -24,24 +25,6 @@ const MAX_PAGE_SIZE = 100;
 const MIN_SOL_TRANSFER = 0.005; // below this a "SOL transfer" is just rent/fee noise
 
 interface SigEntry { signature: string; err: unknown | null }
-
-async function rpcCall(rpcUrl: string, method: string, params: unknown[], timeoutMs = 10_000): Promise<unknown> {
-  const res = await fetch(rpcUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (res.status === 429) {
-    const err = new Error("rate_limited") as Error & { rateLimited: true };
-    err.rateLimited = true;
-    throw err;
-  }
-  if (!res.ok) throw new Error(`http_${res.status}`);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message || "rpc_error");
-  return data.result;
-}
 
 // ---------- event extraction (wallet-scoped) ----------
 
@@ -275,7 +258,7 @@ export interface WalletHistoryPage {
 }
 
 export async function fetchWalletHistoryPage(
-  rpcUrl: string,
+  pool: RpcPool,
   wallet: string,
   before: string | undefined,
   solPrice: number,
@@ -285,12 +268,12 @@ export async function fetchWalletHistoryPage(
   const params: [string, Record<string, unknown>] = [wallet, { limit }];
   if (before) params[1].before = before;
 
-  // The continuous feed shares this same Alchemy key, so a 429 here is
+  // The continuous feed shares the same providers, so a rate-limit here is
   // routine contention, not a dead end — retry instead of failing the page.
   let sigs: SigEntry[] = [];
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      sigs = (await rpcCall(rpcUrl, "getSignaturesForAddress", params)) as SigEntry[];
+      sigs = (await pool.call("getSignaturesForAddress", params)) as SigEntry[];
       break;
     } catch (e) {
       if ((e as { rateLimited?: boolean }).rateLimited && attempt < 3) {
@@ -317,7 +300,7 @@ export async function fetchWalletHistoryPage(
       batch.map(async (sig) => {
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
-            return (await rpcCall(rpcUrl, "getTransaction", [
+            return (await pool.call("getTransaction", [
               sig,
               { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" },
             ])) as RawHeliusTx | null;

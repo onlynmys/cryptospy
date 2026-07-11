@@ -34,14 +34,28 @@ import {
   type SmartWallet,
   type WalletCacheEntry,
 } from "../lib/scannerCore";
-import { startSolanaFeed, type FeedStats } from "./solanaFeed";
+import { startSolanaFeed, makeRpcPool, type FeedStats, type RpcEndpoint } from "./solanaFeed";
 import { fetchWalletHistoryPage } from "./walletHistory";
 
 const PORT = Number(process.env.DISCOVERY_PORT || 4001);
 const SECRET = process.env.DISCOVERY_SECRET || "";
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
-const ALCHEMY_RPC_URL = `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`;
+
+// Primary + failover RPC. Alchemy free tier is the workhorse; when it
+// throttles (per-second 429s or the monthly compute-unit cap tripping as
+// 401/403), calls transparently spill over to Helius's STANDARD RPC — which
+// spends the same credit budget the discovery scans use, hence the hard
+// daily cap so a long Alchemy outage degrades the feed instead of silently
+// draining the scanner's credits too (15K/day ≈ 450K/month worst case,
+// within the 1M free budget).
+const RPC_ENDPOINTS: RpcEndpoint[] = [
+  { name: "alchemy", url: `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` },
+  ...(HELIUS_API_KEY
+    ? [{ name: "helius-rpc", url: `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, dailyLimit: 15_000 }]
+    : []),
+];
+const rpcPool = makeRpcPool(RPC_ENDPOINTS);
 
 // Confirmed working via getSignaturesForAddress on Alchemy's free tier.
 // Jupiter and PumpSwap consistently return empty results at the PROGRAM
@@ -212,7 +226,7 @@ pruneSwapLog();
 
 // Free, credit-free swap collection via public Solana RPC (replaces the Helius webhook)
 const feedStats: FeedStats = startSolanaFeed(
-  ALCHEMY_RPC_URL,
+  rpcPool,
   () => [...POLL_FEED_SOURCES.map((s) => s.address), ...dynamicPairs],
   (tx) => {
     const swap = extractSwapFromRaw(tx, solPriceCache);
@@ -271,7 +285,7 @@ async function flushSymbolLookups() {
 setInterval(flushSymbolLookups, 5_000);
 
 const walletFeedStats: FeedStats = startSolanaFeed(
-  ALCHEMY_RPC_URL,
+  rpcPool,
   () => watchedWallets,
   (tx) => {
     const swap = extractSwapFromRaw(tx, solPriceCache);
@@ -600,7 +614,7 @@ const server = createServer(async (req, res) => {
       const before = url.searchParams.get("before") || undefined;
       const pageSize = Number(url.searchParams.get("limit") || "50") || 50;
       try {
-        const page = await fetchWalletHistoryPage(ALCHEMY_RPC_URL, wallet, before, solPriceCache, pageSize);
+        const page = await fetchWalletHistoryPage(rpcPool, wallet, before, solPriceCache, pageSize);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(page));
       } catch (e) {
@@ -619,6 +633,7 @@ const server = createServer(async (req, res) => {
         feed: feedStats, dynamicPairsWatched: dynamicPairs.length,
         walletFeed: walletFeedStats, watchedWalletsCount: watchedWallets.length,
         heliusBudget: { used: heliusRequestsToday, limit: DAILY_HELIUS_BUDGET, resetsInMin: Math.round((budgetResetAt - Date.now()) / 60000) },
+        rpcEndpoints: rpcPool.status(),
       }));
       return;
     }
