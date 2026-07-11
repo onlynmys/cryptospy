@@ -84,6 +84,17 @@ export default function WalletHistoryPage({ params }: PageProps) {
 
   useEffect(() => {
     loadPage(undefined, true);
+
+    // Record this visit for the search page's "недавно проверенные" list,
+    // regardless of whether the user arrived via search or a direct link
+    // from Scanner/Wallets/DiscoveriesBell.
+    try {
+      const RECENT_KEY = "recent_wallet_checks";
+      const raw = localStorage.getItem(RECENT_KEY);
+      const prev: { address: string; ts: number }[] = raw ? JSON.parse(raw) : [];
+      const updated = [{ address, ts: Date.now() / 1000 }, ...prev.filter((r) => r.address !== address)].slice(0, 10);
+      localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+    } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [address]);
 

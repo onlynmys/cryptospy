@@ -8,9 +8,14 @@ const links = [
   { href: "/", label: "Trending" },
   { href: "/scanner", label: "🧠 Smart Money" },
   { href: "/wallets", label: "Wallets" },
+  { href: "/wallet", label: "🔍 Проверить кошелёк" },
   { href: "/alerts", label: "Alerts" },
   { href: "/settings", label: "Settings" },
 ];
+
+function isActive(path: string, href: string): boolean {
+  return href === "/" ? path === "/" : path === href || path.startsWith(href + "/");
+}
 
 export default function Navbar() {
   const path = usePathname();
@@ -29,8 +34,8 @@ export default function Navbar() {
             <Link
               key={l.href}
               href={l.href}
-              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                path === l.href
+              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
+                isActive(path, l.href)
                   ? "bg-emerald-500/10 text-emerald-400"
                   : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"
               }`}
@@ -63,7 +68,7 @@ export default function Navbar() {
               href={l.href}
               onClick={() => setMobileOpen(false)}
               className={`px-3 py-2 rounded-md text-sm ${
-                path === l.href ? "text-emerald-400 bg-emerald-500/10" : "text-slate-400"
+                isActive(path, l.href) ? "text-emerald-400 bg-emerald-500/10" : "text-slate-400"
               }`}
             >
               {l.label}
