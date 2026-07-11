@@ -30,10 +30,25 @@ const CHAINS = [
   { id: "polygon", label: "Polygon", color: "text-violet-400" },
 ];
 
+interface DiscoveryFilters {
+  minWinRate: number;
+  minPnlUsd: number;
+  maxInactiveHours: number;
+  minTrades: number;
+}
+
+const DISCOVERY_DEFAULT: DiscoveryFilters = { minWinRate: 75, minPnlUsd: 3000, maxInactiveHours: 6, minTrades: 3 };
+
 export default function SettingsPage() {
   const [settings, setSettings] = useState<Settings>(DEFAULT);
   const [saved, setSaved] = useState(false);
   const [showKey, setShowKey] = useState(false);
+
+  const [discoveryFilters, setDiscoveryFilters] = useState<DiscoveryFilters>(DISCOVERY_DEFAULT);
+  const [discoveryLoading, setDiscoveryLoading] = useState(true);
+  const [discoverySaving, setDiscoverySaving] = useState(false);
+  const [discoverySaved, setDiscoverySaved] = useState(false);
+  const [discoveryUnavailable, setDiscoveryUnavailable] = useState(false);
 
   useEffect(() => {
     const stored = localStorage.getItem("cryptospy_settings");
@@ -41,6 +56,43 @@ export default function SettingsPage() {
       try { setSettings({ ...DEFAULT, ...JSON.parse(stored) }); } catch {}
     }
   }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch("/api/discovery-filters", { cache: "no-store" });
+        const d = await r.json();
+        setDiscoveryUnavailable(!!d.unavailable);
+        setDiscoveryFilters({
+          minWinRate: d.minWinRate ?? DISCOVERY_DEFAULT.minWinRate,
+          minPnlUsd: d.minPnlUsd ?? DISCOVERY_DEFAULT.minPnlUsd,
+          maxInactiveHours: d.maxInactiveHours ?? DISCOVERY_DEFAULT.maxInactiveHours,
+          minTrades: d.minTrades ?? DISCOVERY_DEFAULT.minTrades,
+        });
+      } catch {
+        setDiscoveryUnavailable(true);
+      } finally {
+        setDiscoveryLoading(false);
+      }
+    })();
+  }, []);
+
+  async function saveDiscoveryFilters() {
+    setDiscoverySaving(true);
+    try {
+      const r = await fetch("/api/discovery-filters", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(discoveryFilters),
+      });
+      if (r.ok) {
+        setDiscoverySaved(true);
+        setTimeout(() => setDiscoverySaved(false), 2000);
+      }
+    } finally {
+      setDiscoverySaving(false);
+    }
+  }
 
   function save() {
     localStorage.setItem("cryptospy_settings", JSON.stringify(settings));
@@ -142,6 +194,89 @@ export default function SettingsPage() {
                 </div>
               </div>
             </div>
+          </div>
+
+          {/* Auto-discovery filters */}
+          <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-5">
+            <h2 className="text-base font-semibold text-white mb-1 flex items-center gap-2">
+              🔔 Автопоиск (находки)
+            </h2>
+            <p className="text-xs text-slate-500 mb-4">
+              Бот сканирует сеть каждые ~30 минут и складывает подходящие кошельки в колокольчик наверху.
+              Эти пороги строже обычного сканера — тут должны попадать только действительно стоящие кандидаты.
+            </p>
+
+            {discoveryUnavailable && (
+              <div className="text-xs text-yellow-200/80 bg-yellow-500/5 border border-yellow-500/20 rounded-lg px-3 py-2 mb-4">
+                Сервис автосканирования сейчас недоступен — настройки не сохранятся, пока он не заработает
+              </div>
+            )}
+
+            {discoveryLoading ? (
+              <div className="text-sm text-slate-500">Загрузка...</div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1.5">Мин. Win Rate</label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number" min={0} max={100} step={5}
+                        value={discoveryFilters.minWinRate}
+                        onChange={(e) => setDiscoveryFilters((f) => ({ ...f, minWinRate: Number(e.target.value) }))}
+                        className="w-full bg-slate-800/50 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+                      />
+                      <span className="text-xs text-slate-500 shrink-0">%</span>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1.5">Мин. PnL</label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-slate-500 shrink-0">$</span>
+                      <input
+                        type="number" min={0} step={100}
+                        value={discoveryFilters.minPnlUsd}
+                        onChange={(e) => setDiscoveryFilters((f) => ({ ...f, minPnlUsd: Number(e.target.value) }))}
+                        className="w-full bg-slate-800/50 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1.5">Активность за</label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number" min={1} max={168} step={1}
+                        value={discoveryFilters.maxInactiveHours}
+                        onChange={(e) => setDiscoveryFilters((f) => ({ ...f, maxInactiveHours: Number(e.target.value) }))}
+                        className="w-full bg-slate-800/50 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+                      />
+                      <span className="text-xs text-slate-500 shrink-0">ч</span>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1.5">Мин. сделок</label>
+                    <input
+                      type="number" min={1} step={1}
+                      value={discoveryFilters.minTrades}
+                      onChange={(e) => setDiscoveryFilters((f) => ({ ...f, minTrades: Number(e.target.value) }))}
+                      className="w-full bg-slate-800/50 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  onClick={saveDiscoveryFilters}
+                  disabled={discoverySaving}
+                  className={`w-full mt-4 py-2.5 rounded-xl font-semibold text-sm transition-all ${
+                    discoverySaved
+                      ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40"
+                      : "bg-slate-800 text-emerald-400 hover:bg-slate-700"
+                  }`}
+                >
+                  {discoverySaving ? "Сохраняю..." : discoverySaved ? "✓ Сохранено" : "Сохранить пороги автопоиска"}
+                </button>
+              </>
+            )}
           </div>
 
           {/* Chains */}

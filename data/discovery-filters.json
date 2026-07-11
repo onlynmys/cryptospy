@@ -1,0 +1,6 @@
+{
+  "minWinRate": 75,
+  "minPnlUsd": 3000,
+  "maxInactiveHours": 6,
+  "minTrades": 3
+}

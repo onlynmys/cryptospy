@@ -36,6 +36,10 @@ yarn-error.log*
 # vercel
 .vercel
 
+# discovery-server (runs only on this VM, not deployed)
+ecosystem.config.cjs
+/data/discoveries.json
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

@@ -2,6 +2,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import DiscoveriesBell from "./DiscoveriesBell";
 
 const links = [
   { href: "/", label: "Trending" },
@@ -40,6 +41,7 @@ export default function Navbar() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          <DiscoveriesBell />
           <span className="hidden sm:flex items-center gap-1.5 text-xs text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded-full">
             <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
             Live
