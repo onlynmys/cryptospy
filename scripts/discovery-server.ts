@@ -248,6 +248,15 @@ const server = createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "unauthorized" }));
         return;
       }
+      // Emergency circuit breaker: Helius credits ran low unexpectedly, so all
+      // Helius-spending work is paused here regardless of what pings this
+      // endpoint (cron-job.org keeps firing every 30min either way) until
+      // HELIUS_PAUSED is unset.
+      if (process.env.HELIUS_PAUSED === "1") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, paused: true, info: { error: "Helius spending paused — see HELIUS_PAUSED in ecosystem.config.cjs" } }));
+        return;
+      }
       const result = await runDiscoveryScan();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
