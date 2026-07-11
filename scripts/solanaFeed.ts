@@ -41,11 +41,12 @@ interface SigEntry { signature: string; err: unknown | null }
 //
 // One free-tier provider is a single point of failure: when Alchemy starts
 // returning 429/401 (per-second throttle or the monthly compute-unit cap),
-// everything built on it goes blind at once. The pool tries endpoints in
-// order, puts a misbehaving one on cooldown, and moves to the next. A
-// per-endpoint daily call cap keeps a long Alchemy outage from silently
-// draining the backup provider's budget too (Helius standard RPC spends the
-// same credits the discovery scans need).
+// everything built on it goes blind at once. The pool spreads calls across
+// endpoints round-robin (even per-second AND monthly usage with many keys),
+// puts a misbehaving one on a cooldown, and transparently retries the call
+// on the next. A per-endpoint daily call cap keeps a long outage of the
+// others from silently draining a capped provider's budget (Helius standard
+// RPC spends the same credits the discovery scans need).
 
 export interface RpcEndpoint {
   name: string;
@@ -64,6 +65,11 @@ export function makeRpcPool(endpoints: RpcEndpoint[]): RpcPool {
   const cooldownUntil = new Map<string, number>();
   const usedToday = new Map<string, number>();
   let dayResetAt = Date.now() + 24 * 3600 * 1000;
+  // Round-robin start position. Strict priority order made the first live
+  // endpoint absorb ALL traffic (and all the throttling) while the rest sat
+  // idle — with many keys the whole point is spreading per-second load and
+  // monthly usage evenly across them.
+  let rrIndex = 0;
 
   async function rawCall(url: string, method: string, params: unknown[], timeoutMs: number): Promise<unknown> {
     const res = await fetch(url, {
@@ -91,7 +97,9 @@ export function makeRpcPool(endpoints: RpcEndpoint[]): RpcPool {
       dayResetAt = Date.now() + 24 * 3600 * 1000;
     }
     let lastErr: unknown = null;
-    for (const ep of endpoints) {
+    const start = rrIndex++;
+    for (let i = 0; i < endpoints.length; i++) {
+      const ep = endpoints[(start + i) % endpoints.length];
       if (Date.now() < (cooldownUntil.get(ep.name) || 0)) continue;
       if (ep.dailyLimit && (usedToday.get(ep.name) || 0) >= ep.dailyLimit) continue;
       usedToday.set(ep.name, (usedToday.get(ep.name) || 0) + 1);

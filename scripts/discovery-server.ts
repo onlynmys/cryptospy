@@ -42,18 +42,31 @@ const SECRET = process.env.DISCOVERY_SECRET || "";
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
 
-// Primary + failover RPC. Alchemy free tier is the workhorse; when it
-// throttles (per-second 429s or the monthly compute-unit cap tripping as
-// 401/403), calls transparently spill over to Helius's STANDARD RPC — which
-// spends the same credit budget the discovery scans use, hence the hard
-// daily cap so a long Alchemy outage degrades the feed instead of silently
-// draining the scanner's credits too (15K/day ≈ 450K/month worst case,
-// within the 1M free budget).
+// RPC pool: as many free-tier keys as the user cares to register, spread
+// evenly via round-robin (see makeRpcPool). Keys come comma-separated from
+// ALCHEMY_API_KEYS / HELIUS_RPC_KEYS in ecosystem.config.cjs, falling back
+// to the original single-key vars. Every Helius endpoint carries a hard
+// daily cap because its standard-RPC calls spend the same credit budget the
+// discovery scanner needs — a bad day for the Alchemy keys should degrade
+// the feed, not silently drain the scanner (15K/day/key ≈ 450K/month).
+const splitKeys = (v: string | undefined) => (v || "").split(",").map((s) => s.trim()).filter(Boolean);
+const alchemyKeys = splitKeys(process.env.ALCHEMY_API_KEYS).length
+  ? splitKeys(process.env.ALCHEMY_API_KEYS)
+  : splitKeys(ALCHEMY_API_KEY);
+const heliusRpcKeys = splitKeys(process.env.HELIUS_RPC_KEYS).length
+  ? splitKeys(process.env.HELIUS_RPC_KEYS)
+  : splitKeys(HELIUS_API_KEY);
+
 const RPC_ENDPOINTS: RpcEndpoint[] = [
-  { name: "alchemy", url: `https://solana-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}` },
-  ...(HELIUS_API_KEY
-    ? [{ name: "helius-rpc", url: `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, dailyLimit: 15_000 }]
-    : []),
+  ...alchemyKeys.map((key, i) => ({
+    name: alchemyKeys.length > 1 ? `alchemy-${i + 1}` : "alchemy",
+    url: `https://solana-mainnet.g.alchemy.com/v2/${key}`,
+  })),
+  ...heliusRpcKeys.map((key, i) => ({
+    name: heliusRpcKeys.length > 1 ? `helius-${i + 1}` : "helius-rpc",
+    url: `https://mainnet.helius-rpc.com/?api-key=${key}`,
+    dailyLimit: 15_000,
+  })),
 ];
 const rpcPool = makeRpcPool(RPC_ENDPOINTS);
 
@@ -649,6 +662,7 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`discovery-server listening on :${PORT}`);
+  console.log(`RPC pool: ${RPC_ENDPOINTS.map((e) => e.name).join(", ") || "EMPTY — no RPC keys configured!"}`);
   console.log(`HELIUS_API_KEY set: ${!!HELIUS_API_KEY}`);
   console.log(`DISCOVERY_SECRET set: ${!!SECRET}`);
   console.log(`swap log loaded: ${swapLog.length} entries`);
